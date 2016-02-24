@@ -123,7 +123,7 @@ sub reference_cache_load {
 	if ($REF_RANGE_CACHE{$reference} && -f $REF_RANGE_CACHE{$reference}) { 
 		$ref_loc = $REF_RANGE_CACHE{$reference};
 	}else{
-		die "$reference $ref_loc not found\n";
+		die "ERROR ref range cahce for $reference $ref_loc not found\n";
 	}
 
 	open (IN, $ref_loc) or die "ERROR! $sub	: Could not open $ref_loc for reading:$!\n";

@@ -8,15 +8,18 @@ our @ISA = qw(Exporter);
 
 our @EXPORT = ( 
 				"&blastclust_tag_domains",
+				"&cdhit_tag_domains",
 				"&assemble_pf_hhm_db",
 				"&build_rep_hhms",
 				"&generate_pf_group_blastclust_jobs",
+				"&generate_pf_group_cdhit_jobs",
 				"&generate_hhsearch_jobs_for_domain_reps",
 				"&generate_hh_matrix_jobs",
 				"&generate_domain_parse_jobs",
 				"&generate_pf_uids_inx",
 				"&select_domain_representatives",
 				"&read_reference_cache",
+				"&cluster_strip",
 				);
 
 use ECOD::Update;
@@ -48,22 +51,22 @@ my $DOMAIN_PARSE_SCRIPT = '/data/ecod/database_versions/bin/single_parse_domain_
 if ( !-f $DOMAIN_PARSE_SCRIPT ) { die }
 
 sub has_cluster_tag {
-    $_[0]->exists(qq{cluster[\@level="$_[1]"]});
+    $_[0]->exists(qq{cluster[\@level="$_[1]"][\@method="$_[2]"]});
 }
 
 sub create_cluster_tag {
-    my ( $xml_doc, $d_node, $tag, $tag_id ) = @_;
+    my ( $xml_doc, $d_node, $tag, $tag_id, $method ) = @_;
     my $c_node = $xml_doc->createElement('cluster');
-    $c_node->setAttribute( 'method', 'blastclust' );
+    $c_node->setAttribute( 'method', $method );
     $c_node->setAttribute( 'level',  $tag );
     $c_node->setAttribute( 'id',     $tag_id );
     $d_node->appendChild($c_node);
 }
 
 sub build_rep_hhms { 
-	my ($ecod_xml_doc, $tag) = @_;
+	my ($ecod_xml_doc, $tag, $method) = @_;
 	my @cmds;
-	foreach my $domain_node (find_domain_reps($ecod_xml_doc, $tag)) { 
+	foreach my $domain_node (find_domain_reps($ecod_xml_doc, $tag, $method)) { 
 		my ($uid, $ecod_domain_id) = get_ids($domain_node);
 		my $short_uid = substr($uid, 2, 5);
 		if (!-f "$DOMAIN_DATA_DIR/$short_uid/$uid/$uid.hhm" && 
@@ -91,15 +94,15 @@ sub hh_build {
 }
 
 sub select_domain_representatives { 
-	my ($ecod_xml_doc, $tag, $pf_fasta_dir, $prev) = @_;
+	my ($ecod_xml_doc, $tag, $pf_fasta_dir, $prev, $method) = @_;
 	my %clusters;
 	my $missing = 0;
 	my %cluster_has_rep;
 	foreach my $domain_node (find_domain_nodes($ecod_xml_doc)) { 
 		my ($uid, $ecod_domain_id) 	= get_ids($domain_node);
-		if (has_cluster_tag($domain_node, $tag)) { 
-			my $cluster_id		= get_cluster_id($domain_node, $tag);
-			$cluster_has_rep{$cluster_id}++ if is_domain_rep($domain_node, $tag);
+		if (has_cluster_tag($domain_node, $tag, $method)) { 
+			my $cluster_id		= get_cluster_id($domain_node, $tag, $method);
+			$cluster_has_rep{$cluster_id}++ if is_domain_rep($domain_node, $tag, $method);
 			push (@{$clusters{$cluster_id}}, $domain_node);	
 		}else{
 			$missing++;
@@ -108,7 +111,7 @@ sub select_domain_representatives {
 	my $prev_reps;
 	if ($prev) { 
 		my $prev_ecod_xml_doc = xml_open($prev);
-		$prev_reps = get_prev_reps($prev_ecod_xml_doc, $tag);
+		$prev_reps = get_prev_reps($prev_ecod_xml_doc, $tag, $method);
 	}
 
 	printf "#select_domain_representatives: Found %i clusters, %i domains not clustered on this tag\n", scalar keys %clusters, $missing;
@@ -124,9 +127,14 @@ sub select_domain_representatives {
 			my $isXray			= 0;
 			my $xray_res		= '99.99';
 
-			my $isPrevRep 		= exists $$prev_reps{$uid};
+			my $isPrevRep 		= exists $$prev_reps{$uid} ? 1 : 0;
 			my $isManualRep 	= is_manual_domain_rep($domain_node);
-			my $isCurrentRep 	= is_domain_rep($domain_node, $tag);
+			my $isProvisionalRep = is_provisional_domain_rep($domain_node);
+			my $isCurrentRep 	= is_domain_rep($domain_node, $tag, $method);
+			#print "man: $isManualRep prov: $isProvisionalRep cure: $isCurrentRep\n";
+			if (!defined $isCurrentRep) { die "curr undefined: $uid\n" }
+			if (!defined $isProvisionalRep) { die "prov undefined; $uid\n" }
+			if (!defined $isManualRep) { die "man undefined: $uid\n"}
 			
 			if ($domain_node->findvalue('structure/@method') eq 'X-RAY DIFFRACTION') { 
 				$isXray = 1;
@@ -138,7 +146,7 @@ sub select_domain_representatives {
 			if ($domain_node->exists('structure/@deposition_date') && $domain_node->findvalue('structure/@deposition_data') =~ /\d{4}\-\d+\-\d+/) { 
 				$deposition_date = $domain_node->findvalue('structure/@deposition_date');
 			}
-			my $cluster_node = $domain_node->findnodes(qq{cluster[\@level="$tag"]})->get_node(1);
+			my $cluster_node = $domain_node->findnodes(qq{cluster[\@level="$tag"][\@method="$method"]})->get_node(1);
 
 			$deposition_date =~ s/\-//g;
 
@@ -146,6 +154,7 @@ sub select_domain_representatives {
 			$domain{uid}			= $uid;
 			$domain{isManualRep} 	= $isManualRep;
 			$domain{isCurrentRep} 	= $isCurrentRep;
+			$domain{isProvRep}		= $isProvisionalRep;
 			$domain{isPrevRep}		= $isPrevRep;
 			$domain{isXray}			= $isXray;
 			$domain{xray_res}		= $xray_res;
@@ -157,6 +166,8 @@ sub select_domain_representatives {
 		}
 		@domains = sort { 
 				$b->{isCurrentRep} <=> $a->{isCurrentRep} || 
+				$b->{isManualRep} <=> $a->{isManualRep} ||
+				$b->{isProvRep} <=> $a->{isProvrep} ||
 				$b->{isPrevRep} <=> $a->{isPrevRep} ||
 				$b->{isXray} <=> $a->{isXray} ||
 				$a->{xray_res} <=> $b->{xray_res} || 
@@ -169,26 +180,26 @@ sub select_domain_representatives {
 }
 
 sub get_prev_reps { 
-	my $ecod_xml_doc 	= $_[0];
+	my $ecod_xml_doc = $_[0];
 	my $tag 		= $_[1];
+	my $method		= $_[2];
 	my %reps;
 	foreach my $domain (find_domain_nodes($ecod_xml_doc))  { 
 		my ($uid, $ecod_domain_id) = get_ids($domain);
-		if (is_domain_rep($domain, $tag)) { 
+		if (is_domain_rep($domain, $tag, $method)) { 
 			$reps{$uid}++;
 		}
 	}
 	return \%reps;
 }
-sub get_cluster_id { 
-	$_[0]->findvalue(qq{cluster[\@level="$_[1]"]/\@id});
-}
+
 
 sub blastclust_tag_domains {
 
     my ( $ecod_xml_doc, $tag, $pf_fasta_dir ) = @_;
 
     my $clust_i = 1;
+	my $method ='blastclust';
 
     foreach my $pf_node ( find_nodes( $ecod_xml_doc, "//pf_group" ) ) {
 
@@ -212,17 +223,65 @@ sub blastclust_tag_domains {
         foreach my $domain ( find_domain_nodes($pf_node) ) {
             my ( $uid, $ecod_domain_id ) = get_ids($domain);
 
-            if ( has_cluster_tag( $domain, $tag ) ) {
-                foreach my $cluster_node ( find_nodes( $domain, "cluster[\@level=$tag]" ) ) {
+            if ( has_cluster_tag( $domain, $tag, $method ) ) {
+                foreach my $cluster_node ( find_nodes( $domain, "cluster[\@level='$tag'][\@method='$method']" ) ) {
                     $cluster_node->unbindNode;
                 }
             }
 
             if ( $tags{$uid} ) {
-                create_cluster_tag( $ecod_xml_doc, $domain, $tag, $tags{$uid} );
+                create_cluster_tag( $ecod_xml_doc, $domain, $tag, $tags{$uid}, $method );
             }
         }
     }
+}
+
+sub cdhit_tag_domains { 
+	my ($ecod_xml_doc, $tag, $pf_fasta_dir ) = @_;
+	my $clust_i = 1;
+	my $method = 'cdhit';
+	foreach my $pf_node (find_nodes( $ecod_xml_doc, '//pf_group') ) { 
+		next unless $pf_node->findnodes('.//domain')->size() > 0;
+        my $pf_id     = get_pf_id($pf_node);
+        my $ecodf_acc = get_ecodf_acc($pf_node);
+
+        my $path        = "$pf_fasta_dir/$pf_id";
+        my $pf_clust_fn = "$path/$pf_id.$tag.cdhit.clust.clstr";
+
+        open my $fh, "<", $pf_clust_fn
+          or die "ERROR! Could not open $pf_clust_fn for reading:$!\n";
+        my %tags;
+        while ( my $ln = <$fh> ) {
+			if ($ln =~ /^\>Cluster\s+(\d+)/) { 
+				$clust_i++;
+			}elsif ($ln =~ /^\d+/) {
+				my @F = split( /\s+/, $ln);
+				my $n 	= $F[0];
+				my $aa 	= $F[1];
+				my $uid = $F[2];
+				$uid =~ s/>//;
+				$uid =~ s/\.\.\.//;
+				$tags{$uid} = $clust_i;
+			}else{
+				warn "Eh?: $ln\n";
+			}	
+        }
+        close $fh;
+
+        foreach my $domain ( find_domain_nodes($pf_node) ) {
+            my ( $uid, $ecod_domain_id ) = get_ids($domain);
+
+            if ( has_cluster_tag( $domain, $tag, $method ) ) {
+                foreach my $cluster_node ( find_nodes( $domain, "cluster[\@level='$tag'][\@method='$method']" ) ) {
+                    $cluster_node->unbindNode;
+                }
+            }
+
+            if ( $tags{$uid} ) {
+                create_cluster_tag( $ecod_xml_doc, $domain, $tag, $tags{$uid}, $method );
+            }
+        }
+	}
 }
 
 sub build_hh_matrix {
@@ -273,12 +332,12 @@ sub build_hh_matrix {
 }
 
 sub generate_pf_uids_inx { 
-	my ($ecod_xml_doc, $tag, $out_fn) = @_;
+	my ($ecod_xml_doc, $tag, $out_fn, $method) = @_;
 	open my $out_fh, ">", $out_fn or die "ERROR! Couldn't open $out_fn for writing:$!\n";
 	foreach my $pf_group (find_pf_group_nodes($ecod_xml_doc)) { 
 		my $pf_id = get_pf_id($pf_group);
 		#Is this working correctly?
-		foreach my $domain (find_domain_reps($pf_group, $tag)) { 
+		foreach my $domain (find_domain_reps($pf_group, $tag, $method)) { 
 			my ($uid, $ecod_domain_id) = get_ids($domain);
 			print $out_fh "$pf_id\t$uid\n";
 		}
@@ -287,14 +346,14 @@ sub generate_pf_uids_inx {
 
 sub generate_hh_matrix_jobs {
 
-    my ( $ecod_xml_doc, $tag, $pf_uids_inx_fn, $pf_fasta_dir ) = @_;
+    my ( $ecod_xml_doc, $tag, $pf_uids_inx_fn, $pf_fasta_dir, $method ) = @_;
     my ( %reps_analyzed, %total_reps );
     my @cmds;
 	my $local_force_overwrite = 1;
 	foreach my $pf_group (find_pf_group_nodes($ecod_xml_doc)) { 
 		my $pf_id = get_pf_id($pf_group);
 
-		foreach my $domain_rep ( find_domain_reps( $pf_group, $tag ) ) {
+		foreach my $domain_rep ( find_domain_reps( $pf_group, $tag, $method ) ) {
 			my ($uid, $ecod_domain_id) = get_ids($domain_rep);
 			#print "$pf_id $uid\n";
 			my $result_fn = "$uid.$tag.hhr";
@@ -343,26 +402,32 @@ sub parse_hh_xml {
         }
     }
 }
+sub generate_pf_group_cdhit_jobs { 
+	my ($ecod_xml_doc, $tag, $pf_fasta_dir, $global_opt) = @_;
 
-sub generate_pf_group_blastclust_jobs {
-
-    my ( $ecod_xml_doc, $tag, $pf_fasta_dir, $global_opt ) = @_;
-
-    my ( $L, $S );
+    my ( $L, $S, $n );
     if ( $tag eq "F99" ) {
         $L = 0.9;
-        $S = 99;
+        $S = 0.99;
+		$n = 5;
     }
     elsif ( $tag eq 'F40' ) {
         $L = 0.7;
-        $S = 40;
+        $S = 0.40;
+		$n = 2;
     }
+	elsif ($tag eq 'F70') { 
+		$L = 0.7;
+		$S = 0.70;
+		$n = 4;
+	}
     else {
         die "ERROR! tag $tag unknown\n";
     }
 
 	my @cmds;
     foreach my $pf_node ( find_nodes( $ecod_xml_doc, '//pf_group' ) ) {
+		next if $pf_node->findnodes('.//domain')->size() == 0;
 
        # my ( $pf_id, $ecodf_acc ) = get_pf_id($pf_node);
 	   my $pf_id = get_pf_id($pf_node);
@@ -375,7 +440,8 @@ sub generate_pf_group_blastclust_jobs {
             }
         }
 
-        my $pf_fasta_fn = "$path/$pf_id.$tag.fa";
+        #my $pf_fasta_fn = "$path/$pf_id.$tag.fa"; #Why tagged?
+        my $pf_fasta_fn = "$path/$pf_id.fa";
         if ( -f $pf_fasta_fn ) {
             if ( $$global_opt{verify} ) {
                 unless ( verify( $pf_node, $pf_fasta_fn ) ) {
@@ -394,7 +460,74 @@ sub generate_pf_group_blastclust_jobs {
         else {
             gen_pf_fasta( $pf_node, $pf_fasta_fn );
         }
-        ( my $pf_clust_fn = $pf_fasta_fn ) =~ s/fa$/clust/;
+        ( my $pf_clust_fn = $pf_fasta_fn ) =~ s/fa$/$tag.cdhit.clust/;
+        if ( !-f $pf_clust_fn || $$global_opt{force_overwrite} ) {
+            my $cmd = gen_cdhit_job( $pf_fasta_fn, $pf_clust_fn, $S, $L, $n );
+			push (@cmds, $cmd);
+        }
+    }
+	return \@cmds;
+}
+
+
+
+
+sub generate_pf_group_blastclust_jobs {
+
+    my ( $ecod_xml_doc, $tag, $pf_fasta_dir, $global_opt ) = @_;
+
+    my ( $L, $S );
+    if ( $tag eq "F99" ) {
+        $L = 0.9;
+        $S = 99;
+    }
+    elsif ( $tag eq 'F40' ) {
+        $L = 0.4;
+        $S = 40;
+    }
+	elsif ($tag eq 'F70') { 
+		$L = 0.7;
+		$S = 70;
+	}
+    else {
+        die "ERROR! tag $tag unknown\n";
+    }
+
+	my @cmds;
+    foreach my $pf_node ( find_nodes( $ecod_xml_doc, '//pf_group' ) ) {
+
+       # my ( $pf_id, $ecodf_acc ) = get_pf_id($pf_node);
+	   my $pf_id = get_pf_id($pf_node);
+	   print "#$pf_id\n";
+
+        my $path = "$pf_fasta_dir/$pf_id";
+        if ( !-d $path ) {
+            if ( make_path($path) == 0 ) {
+                croak "ERROR! make_path failed on $path:$!\n";
+            }
+        }
+
+        #my $pf_fasta_fn = "$path/$pf_id.$tag.fa"; #Why tagged?
+        my $pf_fasta_fn = "$path/$pf_id.fa";
+        if ( -f $pf_fasta_fn ) {
+            if ( $$global_opt{verify} ) {
+                unless ( verify( $pf_node, $pf_fasta_fn ) ) {
+                    remove($pf_fasta_fn);
+                    gen_pf_fasta( $pf_node, $pf_fasta_fn );
+                }
+            }
+            elsif ( $$global_opt{force_overwrite} ) {
+                remove($pf_fasta_fn);
+                gen_pf_fasta( $pf_node, $pf_fasta_fn );
+            }
+            else {
+                #warn "WARNING! $pf_fasta_fn exists, skipping...\n";
+            }
+        }
+        else {
+            gen_pf_fasta( $pf_node, $pf_fasta_fn );
+        }
+        ( my $pf_clust_fn = $pf_fasta_fn ) =~ s/fa$/$tag.clust/;
         if ( !-f $pf_clust_fn || $$global_opt{force_overwrite} ) {
             my $cmd = gen_blastclust_job( $pf_fasta_fn, $pf_clust_fn, $S, $L );
 			push (@cmds, $cmd);
@@ -406,14 +539,21 @@ sub generate_pf_group_blastclust_jobs {
 sub gen_blastclust_job { 
 	my ($in, $out, $S, $L) = @_;
 	my $BLASTCLUST = '/data/usr1/seals/bin/blastclust';
-	return "$BLASTCLUST -i $in -o $out -S $S -L $L -e F -b T -p T\n"; 
+	return "$BLASTCLUST -i $in -o $out -S $S -L $L -e F -b T -p T"; 
+}
+
+sub gen_cdhit_job { 
+	my ($in, $out, $S, $L, $n) = @_;
+	my $CDHIT = '/usr1/cd-hit-v4.5.6/cd-hit';
+	!-f $CDHIT and die "ERROR! CD-hit executable not found: $CDHIT\n";
+	return "$CDHIT -i $in -o $out -aL $L -c $S -n $n -G 0";
 }
 
 sub generate_domain_parse_jobs {
-    my ( $ecod_xml_doc, $tag, $pf_fasta_dir, $reference, $global_opt ) = @_;
+    my ( $ecod_xml_doc, $tag, $pf_fasta_dir, $reference, $global_opt, $method ) = @_;
 
 	my @cmds;
-    foreach my $domain_rep ( find_domain_reps( $ecod_xml_doc, $tag ) ) {
+    foreach my $domain_rep ( find_domain_reps( $ecod_xml_doc, $tag, $method ) ) {
 
         my $pf_id = get_pf_id($domain_rep);
 
@@ -984,18 +1124,18 @@ sub count_domain_nodes {
 }
 
 sub count_rep_domain_nodes {
-    $_[0]->findnodes(qq{.//domain/cluster[\@level="$_[1]"][\@domain_rep="true"]})->size();
+    $_[0]->findnodes(qq{.//domain/cluster[\@level="$_[1]"][\@method="$_[2]"][\@domain_rep="true"]})->size();
 }
 
 sub assemble_pf_hhm_db {
 
-    my ( $ecod_xml_doc, $tag, $pf_fasta_dir ) = @_;
+    my ( $ecod_xml_doc, $tag, $pf_fasta_dir, $method ) = @_;
 
     foreach my $pf_group ( find_nodes( $ecod_xml_doc, '//pf_group' ) ) {
         my $pf_id = get_pf_id($pf_group);
         if ( count_domain_nodes($pf_group) > 0 ) {
 
-            if ( $tag && count_rep_domain_nodes( $pf_group, $tag ) < 2 ) {
+            if ( $tag && count_rep_domain_nodes( $pf_group, $tag, $method ) < 2 ) {
                 next;
             }
 
@@ -1011,7 +1151,7 @@ sub assemble_pf_hhm_db {
 
           DOMAIN:
             foreach my $domain ( find_domain_nodes($pf_group) ) {
-                if ( is_domain_rep( $domain, $tag ) ) {
+                if ( is_domain_rep( $domain, $tag, $method ) ) {
                     my ( $uid, $ecod_domain_id ) = get_ids($domain);
                     my $short_uid = substr( $uid, 2, 5 );
 
@@ -1034,19 +1174,32 @@ sub assemble_pf_hhm_db {
     }
 }
 
+sub cluster_strip { 
+	my ($ecod_xml_doc, $tag, $method) = @_;
+	foreach my $domain_node (find_domain_nodes($ecod_xml_doc)) { 
+		if ($domain_node->exists("cluster[\@level='$tag'][\@method='$method']")) { 
+			foreach my $cluster_node ($domain_node->findnodes("cluster[\@level='$tag'][\@method='$method']")) { 
+				$cluster_node->unbindNode;
+			}
+		}
+	}
+}
+
+
+
 sub generate_hhsearch_jobs_for_domain_reps {
 
-    my ( $ecod_xml_doc, $tag, $pf_fasta_dir, $global_opt ) = @_;
+    my ( $ecod_xml_doc, $tag, $pf_fasta_dir, $global_opt, $method ) = @_;
 
     my %pf_rep_count;
     foreach my $pf_group ( find_nodes( $ecod_xml_doc, "//pf_group" ) ) {
         #my $pf_id = get_pf_id($pf_group);
 		my $pf_id = $pf_group->findvalue('@pf_id');
-        my $rep_count = count_rep_domain_nodes( $pf_group, $tag );
+        my $rep_count = count_rep_domain_nodes( $pf_group, $tag, $method );
         $pf_rep_count{$pf_id} = $rep_count;
     }
     my @cmds;
-    foreach my $domain_rep ( find_domain_reps( $ecod_xml_doc, $tag ) ) {
+    foreach my $domain_rep ( find_domain_reps( $ecod_xml_doc, $tag, $method ) ) {
         my $pf_id = get_pf_id($domain_rep);
         if ($pf_rep_count{$pf_id} < 2) { 
 			#Not warning-worthy. All singleton pf_groups are skipped	
@@ -1147,6 +1300,7 @@ sub array_eq {
 
 sub gen_pf_fasta {
     my ( $pf_node, $pf_fasta_fn ) = @_;
+	return if $pf_node->findnodes('.//domain')->size() == 0;
     open my $out_fh, ">", $pf_fasta_fn
           or die "ERROR! Could not open $pf_fasta_fn for appending:$!\n";
     foreach my $domain_node ( find_domain_nodes($pf_node) ) {
@@ -1186,7 +1340,7 @@ sub get_domain_fasta_fn {
 }
 
 sub is_domain_rep {
-    $_[0]->findvalue(qq{cluster[\@level='$_[1]']/\@domain_rep}) eq 'true';
+    $_[0]->findvalue(qq{cluster[\@level='$_[1]'][\@method='$_[2]']/\@domain_rep}) eq 'true';
 }
 
 
