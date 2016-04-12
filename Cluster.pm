@@ -126,15 +126,16 @@ sub select_domain_representatives {
 			my ($uid, $ecod_domain_id) = get_ids($domain_node);
 			my $isXray			= 0;
 			my $xray_res		= '99.99';
+			my $deposition_date = '9999-99-99';
 
 			my $isPrevRep 		= exists $$prev_reps{$uid} ? 1 : 0;
 			my $isManualRep 	= is_manual_domain_rep($domain_node);
 			my $isProvisionalRep = is_provisional_domain_rep($domain_node);
 			my $isCurrentRep 	= is_domain_rep($domain_node, $tag, $method);
-			#print "man: $isManualRep prov: $isProvisionalRep cure: $isCurrentRep\n";
 			if (!defined $isCurrentRep) { die "curr undefined: $uid\n" }
 			if (!defined $isProvisionalRep) { die "prov undefined; $uid\n" }
 			if (!defined $isManualRep) { die "man undefined: $uid\n"}
+			if (!defined $isPrevRep) { die "prev undefined: $uid\n"; } 
 			
 			if ($domain_node->findvalue('structure/@method') eq 'X-RAY DIFFRACTION') { 
 				$isXray = 1;
@@ -142,13 +143,13 @@ sub select_domain_representatives {
 					$xray_res = $domain_node->findvalue('structure/@resolution');
 				}
 			}
-			my $deposition_date = '9999-99-99';
-			if ($domain_node->exists('structure/@deposition_date') && $domain_node->findvalue('structure/@deposition_data') =~ /\d{4}\-\d+\-\d+/) { 
+			if ($domain_node->exists('structure/@deposition_date') && $domain_node->findvalue('structure/@deposition_date') =~ /\d{4}\-\d+\-\d+/) { 
 				$deposition_date = $domain_node->findvalue('structure/@deposition_date');
 			}
 			my $cluster_node = $domain_node->findnodes(qq{cluster[\@level="$tag"][\@method="$method"]})->get_node(1);
 
 			$deposition_date =~ s/\-//g;
+			#print "id: $ecod_domain_id uid: $uid man: $isManualRep prov: $isProvisionalRep cure: $isCurrentRep prev: $isPrevRep xray: $isXray res: $xray_res\n";
 
 			$domain{ecod_domain_id}	= $ecod_domain_id;
 			$domain{uid}			= $uid;
@@ -167,7 +168,7 @@ sub select_domain_representatives {
 		@domains = sort { 
 				$b->{isCurrentRep} <=> $a->{isCurrentRep} || 
 				$b->{isManualRep} <=> $a->{isManualRep} ||
-				$b->{isProvRep} <=> $a->{isProvrep} ||
+				$b->{isProvRep} <=> $a->{isProvRep} ||
 				$b->{isPrevRep} <=> $a->{isPrevRep} ||
 				$b->{isXray} <=> $a->{isXray} ||
 				$a->{xray_res} <=> $b->{xray_res} || 
@@ -1340,7 +1341,7 @@ sub get_domain_fasta_fn {
 }
 
 sub is_domain_rep {
-    $_[0]->findvalue(qq{cluster[\@level='$_[1]'][\@method='$_[2]']/\@domain_rep}) eq 'true';
+    $_[0]->findvalue(qq{cluster[\@level='$_[1]'][\@method='$_[2]']/\@domain_rep}) eq 'true' ? 1 : 0;
 }
 
 
