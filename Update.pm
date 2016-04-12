@@ -24,6 +24,8 @@ our @EXPORT =(	"&cluster_pfgroups_by_pfam",
 		"&convert_hmmer_txt_to_xml",
 		"&hmmer_annotation",
 		"&convert_hmmer_to_pfam_annotation",
+		"&convert_manual_range_to_seqid_range",
+		"&convert_mc_manual_range_to_seqid_range",
 		"&generate_blast_library",
 		"&assemble_hmmer_profile_library",
 		"&assemble_hh_profile_library",
@@ -45,6 +47,7 @@ our @EXPORT =(	"&cluster_pfgroups_by_pfam",
 		"&delete_chainwise_domains", 
 		"&pf_reorder", 
 		"&rep_check", 
+		"&rep_check_ecodf",
 		"&add_ecod_domain_ids",
 		"&fix_manual_range_nodes",
 		"&fix_implicit_range_nodes",
@@ -55,6 +58,7 @@ our @EXPORT =(	"&cluster_pfgroups_by_pfam",
 		"&process_run_list_summary_to_ecod",	
 		"&convert_side_load_domains_to_xml",
 		"&process_side_load_domains_to_ecod",
+		"&isMultiChainDomain",
 		);
 
 
@@ -831,13 +835,13 @@ sub generate_ligand_annotation_jobs {
 sub ligand_annotation { 
 	my $sub = 'ligand_annotation';
 	my ($ecod_xml_doc) = @_;
-
+	my $count = 0;
 	DOMAIN:
-	foreach my $domain_node ($ecod_xml_doc->findnodes('/ecod_document/domain_dictionary/architecture/x_group/h_group/f_group/pf_group//domain')) { 
+	foreach my $domain_node (find_domain_nodes($ecod_xml_doc)) { 
 
 		if ($domain_node->exists('ligand_str') && !$FORCE_OVERWRITE) { next } 
-		my $uid = $domain_node->findvalue('@uid');
-		my $ecod_domain_id = $domain_node->findvalue('@ecod_domain_id');
+
+		my ($uid, $ecod_domain_id) = get_ids($domain_node);
 
 		my $short_uid = substr($uid,2, 5);
 		my $pdb = $domain_node->findvalue('structure/@pdb_id');
@@ -895,7 +899,9 @@ sub ligand_annotation {
 			$domain_node->appendChild($ligand_pdbnum_str);
 			print "WARNING! No ligand contact file for $uid $ecod_domain_id\n";
 		}
+		$count++;
 	}
+	printf "#%i domains ligand_annotated\n", $count;
 }
 
 sub generate_image_jobs { 
@@ -1310,15 +1316,6 @@ sub process_run_list_summary_to_ecod {
 	my $restrict_pdbs = 0;
 #my %pdbs;
 	my %domains;
-	if ($ARGV[2]) { 
-		$restrict_pdbs = 1;
-		open (IN, $ARGV[2]) or die "ERROR! Could not open $ARGV[2] for reading:$!\n";
-		while (my $ln = <IN>) { 
-			my @F = split(/\s+/, $ln);
-			#$pdbs{lc($F[0])}{$F[1]}++;
-			$domains{$F[0]}++;
-		}
-	}
 
 	my ($total_domains, $total_chains, $added_domain, $good_chains, $found_domains);
 
@@ -1397,7 +1394,7 @@ sub process_run_list_summary_to_ecod {
 
 				my $f_id 		= $d_node->findvalue('hit_domain/classification/f_group/@f_id');
 				#print "f1 $f_id\n";
-				my $uid = sprintf "%09i", $UID++;
+				#my $uid = sprintf "%09i", $UID++;
 				my $sql_uid = sprintf "%09i", sql_uid_gen();
 
 				my $ecod_domain_node	= $ecod_xml_doc->createElement('domain');
@@ -1607,7 +1604,7 @@ sub process_run_list_summary_to_ecod {
 
 				my $f_id 		= $d_node->findvalue('hit_domain/classification/f_group/@f_id');
 				#print "f1 $f_id\n";
-				my $uid = sprintf "%09i", $UID++;
+				#my $uid = sprintf "%09i", $UID++;
 				my $sql_uid = sprintf "%09i", sql_uid_gen();
 
 				my $ecod_domain_node	= $ecod_xml_doc->createElement('domain');
@@ -1745,7 +1742,7 @@ sub process_run_list_summary_to_ecod {
 		$total_chains++;
 	}
 
-	$doc_node->setAttribute('maxUID', $UID);
+	#$doc_node->setAttribute('maxUID', $UID);
 
 #my $f_group_XPath = '//f_group';
 #
@@ -3507,7 +3504,7 @@ sub apply_merge_v2 {
 	print "$sub: Generate obsolete merge_index\n";
 	my $obsolete_merge_index = obsolete_merge_index($merge_xml_doc);
 	print "$sub: Obsolete old nodes\n";
-	annotate_obsolete_ecod_nodes($old_index, $obsolete_merge_index);
+	annotate_obsolete_ecod_nodes($old_index, $obsolete_merge_index); #This may be vestigial
 
 	#Index modifications
 	print "$sub: Generate modify merge index\n";
@@ -4575,8 +4572,6 @@ sub apply_merge {
 		my $uid = $domain_node->findvalue('@uid');
 		$new_domain_nodes{$uid} = $domain_node;
 	}
-
-
 
 	my $domain_assembly_XPath = '//domain_assembly';
 	my %old_domain_assembly_nodes;
@@ -6058,8 +6053,55 @@ sub fix_manual_range_nodes {
 
 	}
 }
+
+
+sub convert_manual_range_to_seqid_range { 
+	my ($manual_range, $pdb_id, $chain_id) = @_;
+
+	my ($seqid_aref, $struct_seqid_aref, $pdbnum_aref, $asym_id) = pdbml_seq_parse($pdb_id, $chain_id);
+
+	my $m_seqid_aref = pdb_range_expand($manual_range, $pdbnum_aref, $pdb_id, $chain_id);
+
+	my $seqid_range = rangify(@$m_seqid_aref);
+	$seqid_range = scopify_range($seqid_range, $chain_id);
+
+	my $pdb_range = pdb_rangify($m_seqid_aref, $pdbnum_aref);
+	$pdb_range = scopify_range($pdb_range, $chain_id);
+
+	return ($seqid_range, $pdb_range);
+
+}
+
+sub convert_mc_manual_range_to_seqid_range { 
+	my ($manual_range, $pdb_id) = @_;
+
+	my @segs = split(/\,/, $manual_range);
+	my %chains;
+	my @c;
+	foreach my $seg (@segs) { 
+		if ($seg =~ /(.+):/) { 
+			#$chains{$1}++;
+			push (@c, $1);
+		}else{
+			die "regexp error $seg\n";
+		}
+	}
+
+	my ($seqid_aref, $struct_seqid_aref, $pdbnum_href, $asym_id, $chain_aref, $struct_chain_aref) = pdbml_mc_seq_parse($pdb_id, \@c);
+
+	my ($m_range, $m_chain) = multi_chain_pdb_range_expand($manual_range, $seqid_aref, $chain_aref, $pdbnum_href);
+	my $seqid_range = multi_chain_rangify($m_range, $m_chain);
+	my $pdb_range = multi_chain_pdb_rangify($m_range, $pdbnum_href, $m_chain);
+
+	return ($seqid_range, $pdb_range);
+
+
+}
+
+
+
 sub isMultiChainDomain { 
-	if ($_[0]->findvalue('@chain_id') eq '.') { 
+	if ($_[0]->findvalue('structure/@chain_id') eq '.') { 
 		return 1;
 	}else{
 		return 0;
@@ -6349,9 +6391,8 @@ sub add_ecod_domain_ids {
 
 	my ($ecod_xml_doc) = @_;
 
-	my $xpath = '//domain';
 	my %known_ids;
-	foreach my $d_node ($ecod_xml_doc->findnodes($xpath)->get_nodelist() ) { 
+	foreach my $d_node (find_domain_nodes($ecod_xml_doc)) { 
 		if ($d_node->exists('@ecod_domain_id')) {  
 			my $ecod_domain_id = $d_node->findvalue('@ecod_domain_id');
 			$known_ids{$ecod_domain_id}++;
@@ -6361,7 +6402,7 @@ sub add_ecod_domain_ids {
 
 	my %pdb_chains;
 	my %ranges;
-	foreach my $d_node ($ecod_xml_doc->findnodes($xpath)->get_nodelist() ) { 
+	foreach my $d_node (find_domain_nodes($ecod_xml_doc)) { 
 
 		my $uid 	= $d_node->findvalue('@uid');
 
@@ -6384,11 +6425,11 @@ sub add_ecod_domain_ids {
 		my ($pdb, $chain);	
 
 		if ($ecod_domain_id ne 'NA') { 
-			$ecod_domain_id =~ /e(\w{4})(.)/;
+			$ecod_domain_id =~ /e(\w{4})(.+)/;
 			$pdb = $1;
 			$chain = $2;
 		}elsif($scop_domain_id ne 'NA') { 
-			$scop_domain_id =~ /d(\w{4})(.)/;
+			$scop_domain_id =~ /d(\w{4})+(.)/;
 			$pdb = $1;
 			$chain = $2;
 		}else{
@@ -7507,12 +7548,11 @@ sub generate_domain_seqinput_file {
 
 		if ($FILE_TEST && -f "$DOMAIN_DATA_DIR/$short_uid/$domain_uid/$domain_uid.fa" && -s "$DOMAIN_DATA_DIR/$short_uid/$domain_uid/$domain_uid.fa" > 0) { next } 
 
-		print "\t$domain_uid\n";
+		if ($DEBUG) { 
+			print "\t$domain_uid\n";
+		}
 
 		my $seqid_range;
-		my $pdb;
-		my $chain;
-		my $domain_id;
 
 		if ($d_node->findvalue('@derived_range') eq 'true') { 
 			$seqid_range = $d_node->findvalue('derived_seqid_range');
@@ -7527,10 +7567,9 @@ sub generate_domain_seqinput_file {
 			$COUNT++;
 			next;
 		}
-
+		
+		my ($pdb, $chain) = get_pdb_chain($d_node);
 		if ($d_node->exists('structure')) { 
-			$pdb = lc($d_node->findvalue('structure/@pdb_id'));
-			$chain = $d_node->findvalue('structure/@chain_id');
 			my $pdb_chain = $pdb . "_" . $chain;
 			if (!$pc_seen{$pdb_chain}) { 
 				$PC_COUNT++;
@@ -7543,40 +7582,15 @@ sub generate_domain_seqinput_file {
 		}
 		my $ecod_domain_id = $d_node->findvalue('@ecod_domain_id');
 
-		if ($DEBUG) { 
-			print "DEBUG: $domain_uid $pdb $seqid_range\n";
-		}
+		
 
-		my @chains;
-		my @segs;
-
-		if ($d_node->exists('structure')) { 
-			$pdb = lc($d_node->findvalue('structure/@pdb_id'));
-		}else{
-			print "WARNING! No pdb for $domain_uid\n";
-			$COUNT++;
-			next;
-		}
-
-		if ($seqid_range =~ /\w:\-?\d+\-\d+/) { 
-			while ($seqid_range =~ /(\w):(\-?\d+\-\d+)/g) { 
-				my $chain = $1;
-				my $seg	= $2;
-				push (@chains, $chain);
-				push (@segs, $seg);
-			}
-		}else{
-			print "WARNING! range regexp failure on $ecod_domain_id $seqid_range\n";
-			$COUNT++;
-			next;
-		}
-
-		my $fasta_string;
 		print OUT "$ecod_domain_id\t$seqid_range\t$domain_uid\t$pdb\n";
 		$COUNT++;
 			
 	}
-	print "DEBUG $sub: $COUNT $PC_COUNT\n";
+	if ($DEBUG) { 
+		print "DEBUG $sub: $COUNT $PC_COUNT\n";
+	}
 	close OUT;
 	return ($COUNT, $PC_COUNT);
 }
@@ -7681,7 +7695,7 @@ sub generate_hhblits_profile_jobs {
 	DOMAIN:
 	foreach my $new_uid (keys %new_manual_reps) { 
 		my @jobs;
-		my $ecod_domain_id = $new_manual_reps{$new_uid}->findvalue('@ecod_domain_id');
+		my $ecod_domain_id = get_ecod_domain_id($new_manual_reps{$new_uid});
 		my $short_uid = substr($new_uid, 2, 5);
 
 		my $uid_path = "$DOMAIN_DATA_DIR/$short_uid/$new_uid";
@@ -7765,10 +7779,9 @@ sub generate_hmmer_jobs {
 	my ($ecod_xml_doc) = @_;
 	
 	my @jobs;
-	foreach my $domain_node ($ecod_xml_doc->findnodes('//domain')->get_nodelist() ) { 
+	foreach my $domain_node (find_domain_nodes($ecod_xml_doc)) { 
 
-		my $domain_uid = $domain_node->findvalue('@uid');
-
+		my $domain_uid = get_uid($domain_node);
 		my $short_uid = substr($domain_uid, 2, 5);
 
 		my @job_lns;
@@ -7812,7 +7825,7 @@ sub assemble_domain_fasta_library {
 
 		if (!is_rep_only($domain_node) && $reps_only) { next }
 
-		my $uid         = $domain_node->findvalue('@uid');
+		my $uid         = get_uid($domain_node);
 
 		my $short_uid   = substr($uid, 2, 5);
 		my $path = "$DOMAIN_DATA_DIR/$short_uid/$uid";
