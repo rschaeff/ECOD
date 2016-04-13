@@ -24,8 +24,10 @@ our @EXPORT =(	"&cluster_pfgroups_by_pfam",
 		"&convert_hmmer_txt_to_xml",
 		"&hmmer_annotation",
 		"&convert_hmmer_to_pfam_annotation",
+		"&convert_hmmer_to_ecocdf_annotation",
 		"&convert_manual_range_to_seqid_range",
 		"&convert_mc_manual_range_to_seqid_range",
+		"&determine_update_step",
 		"&generate_blast_library",
 		"&assemble_hmmer_profile_library",
 		"&assemble_hh_profile_library",
@@ -149,6 +151,165 @@ my $PSIPRED_DIR 	= '/usr1/psipred/bin';
 my $PSIPRED_DATA_DIR 	= '/usr1/psipred/data';
 my $DOMAIN_DATA_DIR 	= '/data/ecod/domain_data';
 my $CHAIN_DATA_DIR 	= '/data/ecod/chain_data';
+
+
+sub determine_update_step { 
+	my ($update_node) = @_;
+	if (!has_premerge_ecod_fn($update_node) && 
+			has_manual_table_fn($update_node) && 
+			-f get_manual_table_fn($update_node) { 
+			$STEP = 1;
+	}elsif( !has_merge_fn($update_node) &&
+				has_premerge_ecod_fn($update_node) && 
+				-f get_premerge_ecod_fn($update_node)) { 
+			$STEP = 2;
+	}elsif( !has_ecod_fn($update_node)) { 
+		if( has_previous_ecod_fn($update_node) && 
+					has_premerge_ecod_fn($update_node) && 
+					has_merge_fn($update_node) &&
+					-f get_previous_ecod_fn($update_node) && 
+					-f get_premerge_ecod_fn($update_node) &&
+					-f get_merge_fn($update_node) ) {  
+				$STEP = 3;
+		}elsif(
+				has_ecod_tmp_fn($update_node) && 
+				-f get_ecod_tmp_fn($update_node) ) { 
+				$STEP = 4;
+		}else{
+			die "ERROR! Confusion case 1\n";
+		}
+	}elsif(has_ecod_fn($update_node) && -f get_ecod_fn($update_node) { 
+		my $ecod_node = get_ecod_xml_node($update_node);
+		if(!has_chainwise_ecod_fn($update_node)) {  
+				$STEP = 5;
+		}elsif(!has_derived_libraries($update_node)) { 	
+			if(has_chainwise_ecod_fn($update_node) && -f get_chainwise_ecod_fn($update_node)) { 
+				if( 	overlaps_cleaned($ecod_node) && 
+						!ligands_annotated($ecod_node) ) { 
+						$STEP = 6;
+				}elsif(	ligands_annotated($ecod_node) ) {   	
+						$STEP = 7;
+				}
+			}else{
+				die "ERROR! Confusion case 2\n";
+			}
+		}elsif(has_derived_libraries($update_node)) { 
+			if(!pfam_clustered($ecod_node) &&
+					has_update_hmmer_db($ecod_node) &&
+					-f get_update_hmmer_db($ecod_node)) { 
+					$STEP = 8;
+			}elsif(pfam_clustered($ecod_node)) {  
+					$STEP == 9;	
+			}elsif(version_registered($update_node) && 
+					!divergence_calculated($update_node)) { 
+					$STEP = 10;
+			}elsif(divergence_calculated($update_node) && 
+					!divergence_repaired($update_node)) {
+					$STEP = 11;
+			}elsif(divergence_repaired($update_node) && 
+					!representatives_calculated($update_node)) { 
+					$STEP = 12;	
+			}elsif(divergence_repaired($update_node) && 
+					representatives_calculated($update_node)) { 
+					$STEP = 13;
+			}elsif(statistics_updated($update_node)) { 
+					$STEP = 14;
+			}else{
+				die "ERROR! Confusion case 3\n";
+		}
+	}else{
+		die "ERROR! Could not determine update step, aborting...\n";
+	}
+
+	return $STEP;
+}
+
+sub update_dali_summ_cache { 
+
+	my $sub = 'update_dali_summ_cache';
+	my ($old_rep_cache_fn, $ecod_xml_doc, $version) = @_;
+
+	if (!-f $old_rep_cache_fn) { 
+		die "ERROR! Previous rep cache not found: $old_rep_cache_fn\n";
+	}
+
+	my $rep_cache = retrieve($old_rep_cache_fn);
+	
+	printf "#Found %i items in previous dali_summ rep_cache\n", scalar keys %$rep_cache;
+
+	my $man_uids = get_manual_domain_ids($ecod_xml_doc);
+	printf "#Found %i man_reps in ecod xml\n", scalar keys %$man_uids;
+
+	my %domains;
+	foreach my $domain_node (find_domain_nodes($ecod_xml_doc)) { 
+		my ($uid, $ecod_domain_id) = get_ids($domain_node);
+		$domains{$uid} = $domain_node;
+	}
+
+	foreach my $uid (keys %$man_uids) { 
+		my ($pdb_id, $chain_id) = get_pdb_chain($domains{$uid});	
+		next if $chain_id eq '.';
+		if (!exists $$rep_cache{$uid}) { 
+			add_to_rep_cache($uid, $rep_cache, \%domains);
+		}
+	}
+	foreach my $uid (keys %$rep_cache) { 
+		if (!exists $$man_uids{$uid}) { 
+			drop_from_rep_cache($uid, $rep_cache);
+		}
+	}
+
+	my $cache_fn = "$version.dali_summ.rep_cache";
+	if (!nstore($rep_cache, $cache_fn)) { 
+		die "ERROR! Could not store rep_stats in $cache_fn\n";
+	}
+
+}
+sub drop_from_rep_cache { 
+	my ($uid, $rep_cache) = @_;
+
+	delete $$rep_cache{$uid};
+}
+sub add_to_rep_cache { 
+	my ($uid, $rep_cache, $domain_index) = @_;
+
+	my $rep_domain_node = $$domain_index{$uid};
+
+	my $seqid_range = get_seqid_range($rep_domain_node);
+
+	my ($ecod_pdb, $ecod_chain) = get_pdb_chain($rep_domain_node);
+	if ($ecod_chain eq '.') { next}  #This is hacky and should be fixed 1/11/2013
+
+	my $ecod_domain_id = get_ecod_domain_id($$domain_index{$uid});	
+
+	#my $ecod_pdb = $1;
+	my $short_uid = substr($uid, 2, 5);
+	if (!-f "$DOMAIN_DATA_DIR/$short_uid/$uid/$uid.seqres.pdb") { 
+		print "WARNING! No clean domain file for $ecod_domain_id\n";
+	}else{
+		#push (@ecod_reps, $ecod_domain_id);
+		#$ecod_rep_range{$ecod_domain_id} = $seqid_range;
+		$$rep_cache{$uid}{range} = $seqid_range;
+		$$rep_cache{$uid}{ecod_domain_id} = $ecod_domain_id
+	}
+	my ($ecod_seqid_aref, $ecod_struct_seqid_aref, $ecod_pdbnum_href, $ecod_asym_id) = pdbml_seq_parse($ecod_pdb, $ecod_chain);
+	if (!$ecod_seqid_aref) { 
+		print "WARNING! $ecod_pdb, $ecod_chain obsolete in reps\n";
+		next;
+	}
+	print "$ecod_pdb, $ecod_chain, $ecod_domain_id\n";
+	my ($ecod_seq) = pdbml_seq_fetch($ecod_pdb, $ecod_asym_id, $ecod_chain, $ecod_seqid_aref);	
+	if ($ecod_seqid_aref) { 
+		$$rep_cache{$uid}{seqid_aref} 	= $ecod_seqid_aref;
+		$$rep_cache{$uid}{struct_seqid_aref} = $ecod_struct_seqid_aref;
+		$$rep_cache{$uid}{pdbnum_href} 	= $ecod_pdbnum_href;
+		$$rep_cache{$uid}{asym_id}	 	= $ecod_asym_id;
+		$$rep_cache{$uid}{seq}			= $ecod_seq;
+		$$rep_cache{$uid}{pdb}			= $ecod_pdb;
+		$$rep_cache{$uid}{chain}		= $ecod_chain;
+	}
+}
+
 	
 sub generate_dali_summ_cache {  
 	my $sub = 'generate_dali_summ_cache';
