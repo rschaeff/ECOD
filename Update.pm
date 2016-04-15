@@ -27,11 +27,20 @@ our @EXPORT = (
     "&convert_hmmer_to_ecodf_annotation",     "&convert_manual_range_to_seqid_range",
     "&convert_mc_manual_range_to_seqid_range", "&determine_update_step",
     "&generate_blast_library",                 "&assemble_hmmer_profile_library",
+	"&generate_distributable_files",
     "&assemble_hh_profile_library",            "&assemble_domain_fasta_library",
     "&assemble_chainwise_fasta_library",       "&generate_hmmer_jobs",
     "&generate_domain_seqinput_file",          "&generate_domain_range_cache_file",
     "&generate_domain_fasta_jobs",             "&generate_domain_data_directories",
     "&generate_chainwise_fasta_jobs",          "&generate_hhblits_profile_jobs",
+		"&generate_ecod_domain_dump",
+		"&generate_ecod_fasta_dump",
+		"&generate_ecod_pdb_tarball",
+		"&generate_ecod_rep_list",
+		"&generate_distributable_files",
+		"&generate_ecod_rep_list",
+		"&ecodf_acc_to_pfam_acc",
+		"&get_pdbs_by_latest_week",
     "&generate_ligand_annotation_jobs",        "&generate_pdb_structure_jobs",
     "&generate_image_jobs",                    "&ligand_annotation",
     "&build_chainwise",                        "&find_overlaps",
@@ -104,6 +113,362 @@ my $PSIPRED_DATA_DIR = '/usr1/psipred/data';
 my $DOMAIN_DATA_DIR  = '/data/ecod/domain_data';
 my $CHAIN_DATA_DIR   = '/data/ecod/chain_data';
 
+sub ecodf_acc_to_pfam_acc { 
+	my $sub = 'ecodf_acc_to_pfam_acc';
+
+	my $ecodf_xml_fn = "/data/ecodf/ecodf.$HMM_VNUM.xml";
+	if (!-f $ecodf_xml_fn) { 
+		die "ERROR! $sub: Could not find ECODf file $ecodf_xml_fn\n";
+	}
+	my $ecodf_xml_doc = xml_open($ecodf_xml_fn);
+
+	my %ecodf2pfam_accs;
+	foreach my $family_node ($ecodf_xml_doc->findnodes('//family')) { 
+		my $ecodf_acc = $family_node->findvalue('@ecodf_acc');
+		$ecodf_acc =~ /(EF\d+)\./;
+		$ecodf_acc = $1;
+		if ($family_node->exists('@pfam_acc')) { 
+			my $pfam_acc = $family_node->findvalue('@pfam_acc');
+			$pfam_acc =~ /(PF\d+)\./;
+			$pfam_acc = $1;
+			$ecodf2pfam_accs{$ecodf_acc} = $pfam_acc;
+		}
+	}
+	return \%ecodf2pfam_accs;
+}
+my $FGROUP_CLUSTER_METHOD = 'blastclust';
+sub generate_distributable_files {
+	my $sub = 'generate_distributable_files';
+
+	my ($version, $master_ecod_xml, $tag) = @_;
+	print "$sub: $version\n";
+	my $recent_week		= $master_ecod_xml->findvalue('//@mostRecentWeek');
+
+#current ECOD XML;
+	if (!$master_ecod_xml->exists(qq{//reference[\@version="$version"]})) { 
+		die "ERROR! $sub: No $version found in master ref\n";
+	}
+	my $ecod_xml_fn 	= $master_ecod_xml->findvalue(qq{//reference[\@version="$version"]/ref_xml});
+	open (my $xml_fh, $ecod_xml_fn) or die "ERROR! Could not open $ecod_xml_fn for reading:$!\n";
+	my $ecod_xml_doc	= XML::LibXML->load_xml(IO => $xml_fh );
+
+	my $ecod_fasta_fn 	= $master_ecod_xml->findvalue(qq{//reference[\@version="$version"]/domain_fa});
+	my $top_dir		= $master_ecod_xml->findvalue(qq{//reference[\@version="$version"]/local_dir});
+
+	my $current_ecod_domain_dump = "$top_dir/ecod.$version.domains.txt";
+	if ($tag)  { 
+		$current_ecod_domain_dump = "$top_dir/ecod.$version.$tag.domains.txt";
+	}
+	my %pf_lookup;
+	if (!-f $current_ecod_domain_dump) { 
+		generate_ecod_domain_dump($ecod_xml_doc, $current_ecod_domain_dump, $version, \%pf_lookup, $tag, $FGROUP_CLUSTER_METHOD);
+		printf "keys %i\n", scalar keys %pf_lookup;
+	}
+
+	if (!-f $ecod_fasta_fn) { die "ERROR! Could not find ecod fasta $ecod_fasta_fn\n"; } 
+	my $current_ecod_fasta_dump = "$top_dir/ecod.$version.fasta.txt";
+	if ($tag) { 
+		$current_ecod_fasta_dump = "$top_dir/ecod.$version.$tag.fasta.txt";
+	}
+	if (!-f $current_ecod_fasta_dump) { 
+		generate_ecod_fasta_dump($ecod_fasta_fn, $current_ecod_fasta_dump, \%pf_lookup, $tag);
+	}
+
+#current ECOD pdb tarball
+	my $current_ecod_pdb_tarball = "$top_dir/ecod.$version.pdb.tar.gz";
+	if ($tag) { 
+		$current_ecod_pdb_tarball = "$top_dir/ecod.$version.$tag.pdb.tar.gz";
+	}
+	if (!-f $current_ecod_pdb_tarball) { 
+		generate_ecod_pdb_tarball($ecod_xml_doc, $current_ecod_pdb_tarball, $tag);
+	}
+
+#current ECOD rep txt list
+	my $current_ecod_pdb_replist = "$top_dir/reps.$version.txt";
+	if (!-f $current_ecod_pdb_replist) { 
+		generate_ecod_rep_list($ecod_xml_doc, $current_ecod_pdb_replist);
+	}
+
+}
+sub generate_ecod_rep_list { 
+	my ($ecod_xml_doc, $out_fn) = @_;
+
+	open (OUT, ">$out_fn") or die "ERROR! COuld not open $ARGV[0] for writing:$!\n";
+
+	foreach my $rep_domain ($ecod_xml_doc->findnodes('//domain[@manual_rep="true"]')) { 
+		my $uid = $rep_domain->findvalue('@uid');
+		my $ecod_domain_id = $rep_domain->findvalue('@ecod_domain_id');
+		my $seqid_range = $rep_domain->findvalue('seqid_range');
+		print OUT "$uid\t$ecod_domain_id\t$seqid_range\n";
+	}
+	close OUT
+}
+sub generate_ecod_domain_dump { 
+	my $sub = 'generate_ecod_domain_dump';
+	my ($ecod_xml_doc, $output_fn, $current_version, $pf_lookup, $use_pfam_acc, $tag, $method) = @_;
+
+	#print "o: $output_fn, c: $current_version\n";
+	open(OUT, ">$output_fn") or die "ERROR! $sub: Could not open $output_fn for writing:$!\n";
+
+	my $ecodf_translate;
+	if ($use_pfam_acc) { 
+		$ecodf_translate = ecodf_acc_to_pfam_acc();
+	}
+	if (!$tag)  { $tag = 'none' } 
+	my %nodes = ( 
+		'none'  	=> \&find_strict_domain_nodes,
+		F40 	=> \&find_strict_domain_reps,
+		F70		=> \&find_strict_domain_reps,
+		F99    	=> \&find_strict_domain_reps,
+		);
+
+
+
+	#Header needs to be moved outside of code
+	print OUT "#$output_fn\n";
+	print OUT "#ECOD version $current_version\n";
+	print OUT "#Domain list version 1.4\n";
+	print OUT "#Grishin lab (http://prodata.swmed.edu/ecod)\n";
+	print OUT "#uid\tecod_domain_id\tmanual_rep\tf_id\tpdb\tchain\tpdb_range\tseqid_range\tarch_name\tx_name\th_name\tt_name\tf_name\tasm_status\tligand\n";
+	foreach my $arch_node ($ecod_xml_doc->findnodes('//architecture')->get_nodelist() ) { 
+		my $arch_name = $arch_node->findvalue('@arch_name');
+		foreach my $x_node ($arch_node->findnodes('x_group')->get_nodelist() ) { 
+			my $x_name = 'NO_X_NAME';
+			if ($x_node->exists('@name')) { 
+				$x_name = $x_node->findvalue('@name');
+			}
+			foreach my $h_node ($x_node->findnodes('h_group')) { 
+				my $h_name = 'NO_H_NAME';
+				if ($h_node->exists('@name')) { 
+					$h_name = $h_node->findvalue('@name');
+				}
+
+				foreach my $f_node ($h_node->findnodes('f_group')) { 
+					my $f_name = 'NO_T_NAME';
+					if ($f_node->exists('@name')) { 
+						$f_name = $f_node->findvalue('@name');
+					}
+					my $f_id = $f_node->findvalue('@f_id');
+					foreach my $domain_node ($nodes{$tag}->($f_node, $tag, $method)) { 
+						my $ecod_domain_id 	= $domain_node->findvalue('@ecod_domain_id');
+						my $uid			= $domain_node->findvalue('@uid');
+						my $pdb_range 	= get_pdb_range($domain_node);
+						my $seqid_range = get_seqid_range($domain_node);
+						
+						#my $pdb_range           = $domain_node->findvalue('derived_range');
+						my $pdb                 = $domain_node->findvalue('structure/@pdb_id');
+						my $chain               = $domain_node->findvalue('structure/@chain_id');
+
+						my $manual_rep		= "AUTO_NONREP";
+						if ($domain_node->findvalue('@manual_rep') eq 'true') { 
+							$manual_rep 	= "MANUAL_REP";
+						}
+
+						my $pf_type             = 'F_UNCLASSIFIED';
+						my $domain_assembly     = 'NOT_DOMAIN_ASSEMBLY';
+						my $ligand_str			= 'NO_LIGANDS_4A';
+				
+						if ($domain_node->findvalue('ligand_str') =~ /\w+/) { 
+							$ligand_str = $domain_node->findvalue('ligand_str');	
+						}
+						$$pf_lookup{$uid} = $f_id;
+						print OUT "$uid\t$ecod_domain_id\t$manual_rep\t$f_id\t$pdb\t$chain\t$pdb_range\t$seqid_range\t$arch_name\t\"$x_name\"\t\"$h_name\"\t\"$f_name\"\t$pf_type\t$domain_assembly\t$ligand_str\n";
+					}
+					foreach my $domain_assembly_node ($f_node->findnodes('domain_assembly')) { 
+						foreach my $domain_node ($nodes{$tag}->($domain_assembly_node, $tag, $method)){ 
+							my $ecod_domain_id 		= $domain_node->findvalue('@ecod_domain_id');
+							my $uid					= $domain_node->findvalue('@uid');
+							#my $pdb_range           = $domain_node->findvalue('derived_range');
+							my $pdb_range 			= get_pdb_range($domain_node);
+							my $seqid_range 		= get_seqid_range($domain_node);
+							my $pdb                 = $domain_node->findvalue('structure/@pdb_id');
+							my $chain               = $domain_node->findvalue('structure/@chain_id');
+
+							my $manual_rep		= "AUTO_NONREP";
+							if ($domain_node->findvalue('@manual_rep') eq 'true') { 
+								$manual_rep 	= "MANUAL_REP";
+							}
+
+							my $pf_type             = 'F_UNCLASSIFIED';
+							my $domain_assembly     = 'NOT_DOMAIN_ASSEMBLY';
+							my $ligand_str			= 'NO_LIGANDS_4A';
+							$domain_assembly	= $domain_node->parentNode->findvalue('@uid');
+							if ($domain_node->findvalue('ligand_str') =~ /\w+/) { 
+								$ligand_str = $domain_node->findvalue('ligand_str');	
+							}
+							$$pf_lookup{$uid} = $f_id;
+							print OUT "$uid\t$ecod_domain_id\t$manual_rep\t$f_id\t$pdb\t$chain\t$pdb_range\t$seqid_range\t$arch_name\t\"$x_name\"\t\"$h_name\"\t\"$f_name\"\t$pf_type\t$domain_assembly\t$ligand_str\n";
+						}
+					}
+
+					foreach my $pf_node ($f_node->findnodes('pf_group')) { 
+						my $pf_type = 'UNK_F_TYPE';
+						my $pf_id = $pf_node->findvalue('@pf_id');
+						if ($pf_node->findvalue('@pfam_cluster') eq 'true'){ 
+							#$pf_type = 'PFAM_F_GROUP';
+							$pf_type = $pf_node->findvalue('pfam/@pfam_acc');
+						}elsif($pf_node->findvalue('@hh_cluster') eq 'true'){ 
+							$pf_type = 'HH_F_GROUP';
+						}elsif($pf_node->findvalue('@jb_cluster') eq 'true') { 
+							$pf_type = 'F_UNCLASSIFIED';
+						}elsif($pf_node->findvalue('@ecodf_cluster') eq 'true') { 
+							#$pf_type = 'ECODF_F_GROUP';
+							$pf_type = $pf_node->findvalue('ecodf/@ecodf_acc');
+							if ($use_pfam_acc) { 
+								my @f_names = split(/\,/, $pf_type);
+								my @new_f_names;
+								foreach my $f_name (@f_names) { 
+									if (exists $$ecodf_translate{$f_name}) { 
+										push(@new_f_names, $$ecodf_translate{$f_name});
+									}else{
+										push(@new_f_names, $f_name);
+									}
+								}
+								$pf_type = join(",", @new_f_names);
+							}
+						}
+
+						foreach my $domain_node ($nodes{$tag}->($pf_node,$tag, $method)) { 
+							my ($uid, $ecod_domain_id) = get_ids($domain_node);
+							my $pdb_range;
+							if ($domain_node->exists('range')) { 
+								$pdb_range              = $domain_node->findvalue('range');
+							}elsif($domain_node->exists('derived_range')) {
+								$pdb_range              = $domain_node->findvalue('derived_range');
+							}else{
+								$pdb_range = 'NO_RANGE';
+							}
+							my $seqid_range = get_seqid_range($domain_node);
+							my $manual_rep		= "AUTO_NONREP";
+							if ($domain_node->findvalue('@manual_rep') eq 'true') { 
+								$manual_rep 	= "MANUAL_REP";
+							}
+
+							my $ligand_str			= 'NO_LIGANDS_4A';
+							my $pdb                 = $domain_node->findvalue('structure/@pdb_id');
+							my $chain               = $domain_node->findvalue('structure/@chain_id');
+							my $domain_assembly     = 'NOT_DOMAIN_ASSEMBLY';
+							if ($domain_node->parentNode->nodeName eq 'domain_assembly') { 
+								#$domain_assembly  = 'IS_DOMAIN_ASSEMBLY';
+								$domain_assembly	= $domain_node->parentNode->findvalue('@uid');
+							}
+							if ($domain_node->findvalue('ligand_str') =~ /\w+/) { 
+								$ligand_str = $domain_node->findvalue('ligand_str');	
+							}
+							$$pf_lookup{$uid} = $pf_id;
+
+							#print "$ecod_domain_id\t$f_id\t$pdb\t$chain\t$pdb_range\n";
+							print OUT "$uid\t$ecod_domain_id\t$manual_rep\t$pf_id\t$pdb\t$chain\t$pdb_range\t$seqid_range\t$arch_name\t\"$x_name\"\t\"$h_name\"\t\"$f_name\"\t$pf_type\t$domain_assembly\t$ligand_str\n";
+						}
+						foreach my $domain_assembly_node ($pf_node->findnodes('domain_assembly')) { 
+							foreach my $domain_node ($nodes{$tag}->($domain_assembly_node, $tag, $method)){ 
+								my $ecod_domain_id 		= $domain_node->findvalue('@ecod_domain_id');
+								my $uid					= $domain_node->findvalue('@uid');
+								#my $pdb_range           = $domain_node->findvalue('derived_range');
+								my $pdb_range 			= get_pdb_range($domain_node);
+								my $seqid_range 		= get_seqid_range($domain_node);
+								my $pdb                 = $domain_node->findvalue('structure/@pdb_id');
+								my $chain               = $domain_node->findvalue('structure/@chain_id');
+
+								my $manual_rep		= "AUTO_NONREP";
+								if ($domain_node->findvalue('@manual_rep') eq 'true') { 
+									$manual_rep 	= "MANUAL_REP";
+								}
+
+								my $domain_assembly     = 'IS_DOMAIN_ASSEMBLY';
+								$domain_assembly	= $domain_node->parentNode->findvalue('@uid');
+
+								my $ligand_str			= 'NO_LIGANDS_4A';
+								if ($domain_node->findvalue('ligand_str') =~ /\w+/) { 
+									$ligand_str = $domain_node->findvalue('ligand_str');	
+								}
+								$$pf_lookup{$uid} = $f_id;
+								print OUT "$uid\t$ecod_domain_id\t$manual_rep\t$f_id\t$pdb\t$chain\t$pdb_range\t$seqid_range\t$arch_name\t\"$x_name\"\t\"$h_name\"\t\"$f_name\"\t$pf_type\t$domain_assembly\t$ligand_str\n";
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+sub generate_ecod_fasta_dump { 
+	my $sub = 'generate_ecod_fasta_dump';
+	my ($ecod_fasta_fn, $ecod_fasta_output_fn, $pf_lookup_href) = @_;
+	
+	printf "e: $ecod_fasta_fn eo: $ecod_fasta_output_fn keys: %i\n", scalar keys %$pf_lookup_href;
+
+	open (IN, $ecod_fasta_fn) or die "ERROR! $sub: Could not open $ecod_fasta_fn for reading:$!\n";
+	open (OUT, ">$ecod_fasta_output_fn") or die "ERROR! $sub: Could not open $ecod_fasta_output_fn for writing:$!\n";
+
+	my $start = 0;
+	while (my $ln = <IN>) { 
+		if ($ln =~ /^>/) { 
+			$ln =~ s/^>//;
+			my @F = split(/\s+/, $ln);
+			
+			my $uid = $F[2];
+			my $range = $F[1];
+			my $ecod_domain_id = $F[0];
+			if (!$$pf_lookup_href{$uid}) { 
+				#print "No fid for $uid?\n";
+				$start = 0;
+			}else{
+				print OUT ">$uid|$ecod_domain_id|$$pf_lookup_href{$uid}|$range\n";
+				$start = 1;
+			}
+		}else{
+			if ($start) { 
+				print OUT $ln;
+			}
+		}
+	}
+}
+
+sub generate_ecod_pdb_tarball { 
+	my $sub = 'generate_ecod_pdb_tarball';
+	my ($ecod_xml_doc, $output_tarball, $tag) = @_;
+
+
+	my @pdbs;
+	my $missing = 0;
+	my $total = 0;
+	my $xpath = '//domain[@manual_rep="true"]';
+	if ($tag) { 
+		$xpath = "//domain/cluster[\@level='$tag'][\@domain_rep='true']";
+	}
+	foreach my $domain_node ($ecod_xml_doc->findnodes($xpath)) { 
+		if ($tag) { 
+			$domain_node = $domain_node->parentNode;
+		}
+
+		my $ecod_domain_id = $domain_node->findvalue('@ecod_domain_id');
+		my $uid		= $domain_node->findvalue('@uid');
+		my $short_uid	= substr($uid, 2, 5);
+
+		my $pdb_fn = "$DOMAIN_DATA_DIR/$short_uid/$uid/$uid.pdbnum.pdb";
+		#my $pdb_fn = "$DOMAIN_DATA_DIR/$short_uid/$uid/$uid.pdb";
+
+		if (!-f $pdb_fn) { 
+		#	print "WARNING! No pdb for $pdb_fn $ecod_domain_id/$uid\n";
+			$missing++;
+		}else{
+			push (@pdbs, $pdb_fn);
+		}
+		$total++;
+	}
+	printf "#%i missing pdbs of %i total\n", $missing, $total;
+	open (OUT, ">pdb_lst.tmp.fn"); 
+	foreach my $pdb_fn (@pdbs) { 
+		print OUT "$pdb_fn\n";
+	}
+	close OUT;
+
+	my $tar_cmd = "tar -czf $output_tarball -T pdb_lst.tmp.fn\n";
+	system($tar_cmd);
+
+}
 sub determine_update_step {
     my ($update_node) = @_;
     my $STEP;
@@ -168,7 +533,7 @@ sub determine_update_step {
             {
                 $STEP = 8;
             }
-            elsif ( pfam_clustered($ecod_node) ) {
+            elsif ( pfam_clustered($ecod_node) && !version_registered($update_node) ) {
                 $STEP = 9;
             }
             elsif ( version_registered($update_node)
