@@ -52,6 +52,8 @@ our @EXPORT = (
     "&parse_ecod_txt_to_xml",                  "&process_run_list_summary_to_ecod",
     "&convert_side_load_domains_to_xml",       "&process_side_load_domains_to_ecod",
     "&isMultiChainDomain",
+	"&update_release_statistics",	"&write_stats_gnuplot_script",
+	"&basic_ecod_stats",
 );
 
 my $DOMAIN_IMAGE_EXE = '/data/ecod/domain_image_new.py';
@@ -113,6 +115,308 @@ my $PSIPRED_DATA_DIR = '/usr1/psipred/data';
 my $DOMAIN_DATA_DIR  = '/data/ecod/domain_data';
 my $CHAIN_DATA_DIR   = '/data/ecod/chain_data';
 
+sub basic_ecod_stats { 
+	my $sub = 'basic_ecod_stats';
+	my ($ref_xml_fn, $ref_version) = @_;
+
+	open (my $xml_fh, $ref_xml_fn) or die "ERROR! $sub: Could not open $ref_xml_fn for reading:$!\n";
+
+	my $ecod_xml_doc = XML::LibXML->load_xml( IO => $xml_fh );
+	close $xml_fh;
+
+	my %stats;
+	my $arch 	= $ecod_xml_doc->findnodes('//architecture')->size();
+	my $x_groups 	= $ecod_xml_doc->findnodes('//x_group')->size();
+	my $h_groups 	= $ecod_xml_doc->findnodes('//h_group')->size();
+	my $f_groups 	= $ecod_xml_doc->findnodes('//f_group')->size();
+	my $pf_groups	= $ecod_xml_doc->findnodes('//pf_group')->size();
+	my $domains	= $ecod_xml_doc->findnodes('//domain')->size();
+	
+	my %pdbs;
+	my %peptide_chain;
+	my %chain;
+	foreach my $structure_node ($ecod_xml_doc->findnodes('//structure')) { 
+		my $pdb_id = $structure_node->findvalue('@pdb_id');
+		$pdbs{$pdb_id}++;
+	}
+	my $peptides 	= $ecod_xml_doc->findnodes('//peptide')->size();
+	foreach my $peptide_node ($ecod_xml_doc->findnodes('//peptide')->get_nodelist()) { 
+		my $pdb_id = lc($peptide_node->findvalue('@pdb_id'));
+		$pdbs{$pdb_id}++;
+		my $chain_id = $peptide_node->findvalue('@chain_id');
+		my $pdb_chain = $pdb_id . "_" . $chain_id;
+		$chain{$pdb_chain}++;
+		$peptide_chain{$pdb_chain}++;
+	}
+
+#synthetics
+	my $synth	= $ecod_xml_doc->findnodes('//synthetic')->size();
+	foreach my $synth_node ($ecod_xml_doc->findnodes('//synth')->get_nodelist()) { 
+		my $pdb_id	= lc($synth_node->findvalue('@pdb_id'));
+		$pdbs{$pdb_id}++;
+		my $chain_id	= $synth_node->findvalue('@chain_id');
+		my $pdb_chain = $pdb_id . "_" . $chain_id;
+		$chain{$pdb_chain}++;
+		$peptide_chain{$pdb_chain}++;
+	}
+
+#pss
+	my $pss		= $ecod_xml_doc->findnodes('//pss')->size();
+	foreach my $pss_node ($ecod_xml_doc->findnodes('//pss')->get_nodelist()) { 
+		my $pdb_id = lc($pss_node->findvalue('@pdb_id'));
+		$pdbs{$pdb_id}++;
+		my $chain_id = $pss_node->findvalue('@chain_id');
+		my $pdb_chain = $pdb_id . "_" . $chain_id;
+		$chain{$pdb_chain}++;
+		$peptide_chain{$pdb_chain}++;
+	}
+#nonpep_poly
+	my $npp	=	$ecod_xml_doc->findnodes('//nonpeptide_poly')->size;
+	foreach my $npp_node ($ecod_xml_doc->findnodes('//nonpeptide_poly')->get_nodelist() ) { 
+
+		my $pdb_id	= lc($npp_node->findvalue('@pdb'));
+		$pdbs{$pdb_id}++;
+		my $chain_str = $npp_node->findvalue('@chain');
+		my @chains	= split(/,/, $chain_str);
+		foreach my $chain_id (@chains) { 
+			my $pdb_chain = $pdb_id . "_" . $chain_id;
+			$chain{$pdb_chain}++;
+		}
+	}
+#Coiled-coil
+	my $coil =	$ecod_xml_doc->findnodes('//coil')->size();
+	foreach my $coil_node ($ecod_xml_doc->findnodes('//coil')->get_nodelist() ) { 
+		my $pdb_id = lc($coil_node->findvalue('@pdb_id'));
+		$pdbs{$pdb_id}++;
+		my $chain_id = $coil_node->findvalue('@chain_id');
+		my $pdb_chain = $pdb_id . "_" . $chain_id;
+		$chain{$pdb_chain}++;
+		$peptide_chain{$pdb_chain}++;
+	}
+
+
+#MCC
+	my $mcc	= $ecod_xml_doc->findnodes('//mcc')->size();
+	foreach my $mcc_node ($ecod_xml_doc->findnodes('//mcc')->get_nodelist() ) { 
+
+		my $pdb_id	= lc($mcc_node->findvalue('@pdb_id'));
+		$pdbs{$pdb_id}++;
+		my $chain_id = $mcc_node->findvalue('@chain');
+		my $pdb_chain = $pdb_id . "_" . $chain_id;
+		$chain{$pdb_chain}++;
+		$peptide_chain{$pdb_chain}++;
+	}
+
+#CreatedOn
+
+	my $xml_date;
+	my $graph_date;
+	$ref_version =~ /develop((\d+)\w?)/;
+	my $ref_int = $2;
+	my $ref_subversion = $1;
+	my $ref_v = 'v'. $ref_int;
+	print "$ref_version $ref_int $ref_v $ref_subversion\n";
+
+	my %month_translation = ( 
+		"Jan" => "01",
+		"Feb" => "02",
+		"Mar" => "03",
+		"Apr" => "04",
+		"May" => "05",
+		"Jun" => "06",
+		"Jul" => "07",
+		"Aug" => "08",
+		"Sep" => "09",
+		"Oct" => "10",
+		"Nov" => "11",
+		"Dec" => "12"
+		);
+		
+
+	if ($ecod_xml_doc->exists(qq{//createdOn[\@version="$ref_version"]})) { 
+		my $createdOn = $ecod_xml_doc->findnodes(qq{//createdOn[\@version="$ref_version"]})->get_node(1);
+		$xml_date = $createdOn->textContent;
+	}elsif ($ecod_xml_doc->exists(qq{//createdOn[\@version="$ref_int"]}) ){
+		my $createdOn = $ecod_xml_doc->findnodes(qq{//createdOn[\@version="$ref_int"]})->get_node(1);
+		$xml_date = $createdOn->textContent;
+	}elsif ($ecod_xml_doc->exists(qq{//createdOn[\@version="$ref_v"]}) ) { 
+		my $createdOn = $ecod_xml_doc->findnodes(qq{//createdOn[\@version="$ref_v"]})->get_node(1);
+		$xml_date = $createdOn->textContent;
+	}elsif ($ecod_xml_doc->findnodes(qq{//createdOn})->size() == 1) { 
+		my $createdOn = $ecod_xml_doc->findnodes(qq{//createdOn})->get_node(1);
+		$xml_date = $createdOn->textContent;
+	}else{
+		print "WARNING! No date found for $ref_version\n";
+		$xml_date = "NOT_FOUND";
+	}
+
+	if ($xml_date =~ /(\w{3})\s(\w{3})\s+(\d+)\s+(\d+\:\d+\:\d+)\s+(\w+)\s+(\w{4})/)  { 
+		my $weekday = $1;
+		my $month = $month_translation{$2};
+		my $day = sprintf "%02i", $3;
+		my $time = $4;
+		my $timezone = $5;
+		my $year = $6;
+		$graph_date = $year . $month . $day;
+	}else{
+		$graph_date = "NOT_FOUND";
+	}
+	print "$xml_date $graph_date\n";
+
+
+	$stats{arch} = $arch;
+	$stats{xgrp} = $x_groups;
+	$stats{hgrp} = $h_groups;		
+	$stats{tgrp} = $f_groups;
+	$stats{fgrp} = $pf_groups;
+	$stats{domn} = $domains;
+	$stats{pdbs} = keys %pdbs;
+	$stats{date} = $graph_date;
+
+	return \%stats;
+}
+sub write_stats_gnuplot_script { 
+	my $sub = 'write_stats_gnuplot_script';
+	my ($ref_aref, $out_fn) = @_;
+
+	my $out_gplt_fn = $out_fn;
+	$out_gplt_fn =~ s/txt/gplt/;
+	
+	open (OUT, ">$out_gplt_fn");
+
+	print OUT "set term svg size 800,600\n";
+	print OUT "set output 'stats_groups.svg'\n";
+
+	print OUT "set ylabel 'Groups'\n";
+	print OUT "set xlabel 'Version'\n";
+
+	my @ref_labels;
+	for (my $i = 0; $i < scalar(@$ref_aref); $i++) { 
+		push (@ref_labels, "\"$$ref_aref[$i]\" $i")
+	}
+
+	my $string = join(",", @ref_labels);
+
+	print OUT "set xtics rotate ($string)\n";
+	print OUT "set key below\n";
+	print OUT "plot '$out_fn' u 3 t 'X-groups', '$out_fn' u 4 t 'H-groups', '$out_fn' u 5 t 'T-groups', '$out_fn' u 6 t 'F-groups'\n";
+
+	print OUT "set output 'stats_domains.svg'\n";
+	print OUT "set ylabel 'Domain/Structure Counts'\n";
+
+	print OUT "plot '$out_fn' u 7 t 'Domains', '$out_fn' u 8 t 'PDBs'\n";
+}
+
+sub update_release_statistics { 
+	my $sub = 'update_release_statistics';
+
+	my ($ecod_master_ref_xml, $stats_xml_fn, $stats_txt_fn) = @_;
+
+	my %references;
+	foreach my $reference_node ($ecod_master_ref_xml->findnodes('//reference'))  { 
+
+		my $version  = $reference_node->findvalue('@version');
+		if ($version =~ /repsonly/) { next }  #This is a hack, remove those versions from master index
+		if ($reference_node->exists('ref_xml')) { 
+			my $ref_xml = $reference_node->findvalue('ref_xml');
+			$references{$version} = $ref_xml;
+		}
+
+	}
+
+	my @references = sort {$a =~ /develop(\d+)/; my $anum = $1; $b =~ /develop(\d+)/; my $bnum = $1;$anum <=> $bnum} keys %references;
+
+	open (my $xml_fh, $stats_xml_fn) or die "ERROR! Could not open $stats_xml_fn for reading:$!\n";
+	my $stats_xml_doc = XML::LibXML->load_xml(IO => $xml_fh);
+
+	my $stats_list_node = $stats_xml_doc->findnodes('//release_statistics_list')->get_node(1);
+
+	foreach my $ref (@references) { 
+		print "#$ref $references{$ref}\n";
+		if ($stats_xml_doc->exists(qq{//release_statistics[\@version="$ref"]})) { 
+			next;
+		}
+		if (!-f $references{$ref}) { print "WARNING! $references{$ref} not found\n"; next} 
+
+		my $stats_ref = basic_ecod_stats($references{$ref}, $ref);
+
+		my $version 	= $ref;
+		my $arch_count	= $$stats_ref{arch};
+		my $x_count	= $$stats_ref{xgrp};
+		my $h_count	= $$stats_ref{hgrp};
+		my $t_count	= $$stats_ref{tgrp};
+		my $f_count	= $$stats_ref{fgrp};
+
+		my $dom_count	= $$stats_ref{domn};
+		my $pdb_count	= $$stats_ref{pdbs};
+		my $week_label 	= $$stats_ref{date};
+		my $stats_node = $stats_xml_doc->createElement('release_statistics');
+
+		$stats_node->setAttribute('version', $version);
+		$stats_node->setAttribute('arch_count', $arch_count);
+		$stats_node->setAttribute('x_count', $x_count);
+		$stats_node->setAttribute('h_count', $h_count);
+		$stats_node->setAttribute('t_count', $t_count);
+		$stats_node->setAttribute('f_count', $f_count);
+		$stats_node->setAttribute('dom_count', $dom_count);
+		$stats_node->setAttribute('pdb_count', $pdb_count);
+		$stats_node->setAttribute('week_label', $week_label);
+
+		$stats_list_node->appendChild($stats_node);
+
+
+	}
+
+	my %dates_by_ref;
+	foreach my $ref (@references) { 
+		my $stats_node = $stats_xml_doc->findnodes(qq{//release_statistics[\@version="$ref"]})->get_node(1);
+		my $week_label = $stats_node->findvalue('@week_label');
+		$dates_by_ref{$ref} = $week_label;
+	}
+
+	my $out_fn = $stats_xml_fn;
+	open (OUT, ">$out_fn") or die "ERROR! Could not open $out_fn for writing:$!\n";
+	my $doc_string = $stats_xml_doc->toString(1);
+	print OUT $doc_string;
+	close OUT;
+	my @dates;
+	foreach my $ref (@references) { 
+		push (@dates, $dates_by_ref{$ref});
+	}
+
+	my $stats_fn = $stats_txt_fn;
+	open (OUT, ">$stats_fn") or die "ERROR! could not open $stats_fn for writing:$!\n";
+	print OUT "#version\tarch_count\tx_count\th_count\tt_count\tf_count\tdom_count\tpdb_count\tdate\n";
+	foreach my $stats_node ($stats_xml_doc->findnodes('//release_statistics')) { 
+
+		my $version 	= $stats_node->findvalue('@version');
+		my $arch_count 	= $stats_node->findvalue('@arch_count');
+		my $x_count	= $stats_node->findvalue('@x_count');
+		my $h_count	= $stats_node->findvalue('@h_count');
+		my $t_count	= $stats_node->findvalue('@t_count');
+		my $f_count	= $stats_node->findvalue('@f_count');
+		my $dom_count	= $stats_node->findvalue('@dom_count');
+		my $pdb_count	= $stats_node->findvalue('@pdb_count');
+		my $week_label  = $stats_node->findvalue('@week_label');
+
+		printf OUT "%s\t%i\t%i\t%i\t%i\t%i\t%i\t%i\t%s\n", 
+			$version,
+			$arch_count,
+			$x_count,
+			$h_count,
+			$t_count,
+			$f_count,
+			$dom_count,
+			$pdb_count,
+			$week_label;
+	}
+	close OUT;
+
+
+	write_stats_gnuplot_script(\@dates, $stats_fn);
+
+
+}
 sub ecodf_acc_to_pfam_acc { 
 	my $sub = 'ecodf_acc_to_pfam_acc';
 
@@ -8936,6 +9240,10 @@ sub assemble_chainwise_fasta_library {
             print "WARNING! $sub: dir $CHAIN_DATA_DIR/$two/$pc not found\n";
             next;
         }
+		if (!-f "$CHAIN_DATA_DIR/$two/$pc/$pc.fa") { 
+		    print "WARNING! $sub: dir $CHAIN_DATA_DIR/$two/$pc/$pc.fa not found\n";
+            next;
+		}
         open( IN, "$CHAIN_DATA_DIR/$two/$pc/$pc.fa" )
           or die "ERROR! $sub:  $CHAIN_DATA_DIR/$two/$pc/$pc.fa file not found\n";
 
