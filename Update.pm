@@ -3523,9 +3523,6 @@ sub merge_new_ecod_pre_xml_to_old_ecod_xml {
 
         my $h_id   = get_h_id($h_group);
         my $h_name = has_name($h_group) ? get_name($h_group) : 'NA';
-        if ( $h_group->exists('@name') ) {
-            $h_name = $h_group->findvalue('@name');
-        }
         my $h_ordinal = 'NaN';
         if ( $h_group->exists('@h_ordinal') ) {
             $h_ordinal = $h_group->findvalue('@h_ordinal');
@@ -3636,18 +3633,11 @@ sub merge_new_ecod_pre_xml_to_old_ecod_xml {
     my %old_f_ordinal;
 
     print "Read old f\n";
-    foreach my $f_group ( $old_ecod_xml_doc->findnodes('//f_group') ) {
+    foreach my $f_group ( find_f_group_nodes($old_ecod_xml_doc) ) {
 
-        my $f_id   = $f_group->findvalue('@f_id');
-        my $f_name = 'NA';
-        if ( $f_group->exists('@name') ) {
-            $f_name = $f_group->findvalue('@name');
-        }
-
-        my $f_ordinal = 'NaN';
-        if ( $f_group->exists('@f_group') ) {
-            $f_ordinal = $f_group->findvalue('@f_ordinal');
-        }
+		my $f_id 		= get_f_id($f_group);
+        my $f_name 		= has_name($f_group) ? get_name($f_group) : 'NA';
+        my $f_ordinal 	= has_f_ordinal($f_group) ? get_f_ordinal($f_group) : 'NaN';
 
         $old_f_seen{$f_id}++;
         $old_f_name{$f_id}    = $f_name;
@@ -3655,17 +3645,11 @@ sub merge_new_ecod_pre_xml_to_old_ecod_xml {
     }
 
     print "Read new f\n";
-    foreach my $f_group ( $new_ecod_xml_doc->findnodes('//f_group') ) {
+    foreach my $f_group ( find_f_group_nodes($new_ecod_xml_doc)) {
 
-        my $f_id   = $f_group->findvalue('@f_id');
-        my $f_name = 'NA';
-        if ( $f_group->exists('@name') ) {
-            $f_name = $f_group->findvalue('@name');
-        }
-        my $f_ordinal = 'NaN';
-        if ( $f_group->exists('@f_ordinal') ) {
-            $f_ordinal = $f_group->findvalue('@f_ordinal');
-        }
+		my $f_id 		= get_f_id($f_group);
+        my $f_name 		= has_name($f_group) ? get_name($f_group) : 'NA';
+        my $f_ordinal 	= has_f_ordinal($f_group) ? get_f_ordinal($f_group) : 'NaN';
 
         $new_f_seen{$f_id}++;
         $new_f_name{$f_id}    = $f_name;
@@ -3776,49 +3760,25 @@ sub merge_new_ecod_pre_xml_to_old_ecod_xml {
     );
 
     print "Read new domain assemblies\n";
-    foreach my $domain_assembly ( $new_ecod_xml_doc->findnodes('//domain_assembly')->get_nodelist() ) {
+    foreach my $domain_assembly ( find_domain_assembly_nodes($new_ecod_xml_doc)) { 
 
-        my $uid = $domain_assembly->findvalue('@uid');
+		my $uid = get_uid($domain_assembly);
 
-        my $f_id;
-        if ( $domain_assembly->parentNode->nodeName eq 'f_group' ) {
-            $f_id = $domain_assembly->parentNode->findvalue('@f_id');
-        }
-        elsif ( $domain_assembly->parentNode->parentNode->nodeName eq 'f_group' ) {
-            $f_id = $domain_assembly->parentNode->parentNode->findvalue('@f_id');
-        }
-        else {
-            die "Confused domain assembly $uid\n";
-        }
-
-        my $assembly_type = $domain_assembly->findvalue('@assembly_type');
+		my $f_id = get_f_id_from_domain_node($domain_assembly);
+     
+		my $assembly_type = get_assembly_type($domain_assembly);
 
         my $primary_domain_id;
-        my $primary_domain;
-        if ( $domain_assembly->exists('domain[@primary="true"]') ) {
-            $primary_domain = $domain_assembly->findnodes('domain[@primary="true"]')->get_node(1);
-            if ( $primary_domain->exists('scop_domain') ) {
-                $primary_domain_id = $primary_domain->findvalue('scop_domain/@scop_domain_id');
-            }
-            elsif ( $primary_domain->exists('ecod_domain') ) {
-                $primary_domain_id = $primary_domain->findvalue('ecod_domain/@ecod_domain_id');
-            }
-            else {
-                die "?da $uid\n";
-            }
-        }
-        else {
-            print "WARNING! Domain assembly $uid has no primary domainid\n";
-        }
+        my $primary_domain = get_primary_domain_id($domain_assembly);
 
         my %domain_consist;
-        foreach my $domain ( $domain_assembly->findnodes('domain')->get_nodelist() ) {
+        foreach my $domain ( find_domain_nodes($domain_assembly)) { 
             my $domain_id;
-            if ( $domain->exists('scop_domain') ) {
-                $domain_id = $domain->findvalue('scop_domain/@scop_domain_id');
+            if ( has_scop_domain_node($domain)) { 
+                $domain_id = get_scop_domain_id(get_scop_domain_node($domain);
             }
-            elsif ( $domain->exists('ecod_domain') ) {
-                $domain_id = $domain->findvalue('ecod_domain/@ecod_domain_id');
+            elsif ( has_ecod_domain_node($domain)  ) {
+                $domain_id = get_ecod_domain_id(get_ecod_domain_node($domain));
             }
             else {
                 die "?da $uid\n";
@@ -3858,48 +3818,26 @@ sub merge_new_ecod_pre_xml_to_old_ecod_xml {
     );
     my ( %old_domain_assembly_type, %old_domain_assembly_derivedFrom, %old_domain_assembly_derivedFrom_uid );
     print "Read old domain assemblies\n";
-    foreach my $domain_assembly ( $old_ecod_xml_doc->findnodes('//domain_assembly')->get_nodelist() ) {
+    foreach my $domain_assembly ( find_domain_assembly_nodes($old_ecod_xml_doc)) { 
 
-        my $uid = $domain_assembly->findvalue('@uid');
+        my $uid = get_uid($domain_assembly);
 
-        my $f_id;
-        if ( $domain_assembly->parentNode->nodeName eq 'f_group' ) {
-            $f_id = $domain_assembly->parentNode->findvalue('@f_id');
-        }
-        elsif ( $domain_assembly->parentNode->parentNode->nodeName eq 'f_group' ) {
-            $f_id = $domain_assembly->parentNode->parentNode->findvalue('@f_id');
-        }
-        else {
-            die "Confused domain assembly $uid\n";
-        }
+        my $f_id = get_f_id_from_domain_node($domain_assembly);
         $old_domain_assembly_uid_fid{$uid} = $f_id;
-        my $assembly_type = $domain_assembly->findvalue('@assembly_type');
+
+        my $assembly_type = get_assembly_type($domain_assembly);
 
         my $primary_domain_id;
-        my $primary_domain;
-        if ( $domain_assembly->exists('domain[@primary="true"]') ) {
-            $primary_domain = $domain_assembly->findnodes('domain[@primary="true"]')->get_node(1);
-            if ( $primary_domain->exists('scop_domain') ) {
-                $primary_domain_id = $primary_domain->findvalue('scop_domain/@scop_domain_id');
-            }
-            elsif ( $primary_domain->exists('ecod_domain') ) {
-                $primary_domain_id = $primary_domain->findvalue('ecod_domain/@ecod_domain_id');
-            }
-            else {
-                die "?da $uid\n";
-            }
-        }
-        else {
-            print "WARNING! Domain assembly $uid has no primary domainid\n";
-        }
+        my $primary_domain = get_primary_domain_id($domain_assembly);
+
         my %domain_consist;
-        foreach my $domain ( $domain_assembly->findnodes('domain')->get_nodelist() ) {
+        foreach my $domain ( find_domain_nodes($domain_assembly)) { 
             my $domain_id;
-            if ( $domain->exists('scop_domain') ) {
-                $domain_id = $domain->findvalue('scop_domain/@scop_domain_id');
+            if ( has_scop_domain_node($domain)) { 
+                $domain_id = get_scop_domain_id(get_scop_domain_node($domain));
             }
-            elsif ( $domain->exists('ecod_domain') ) {
-                $domain_id = $domain->findvalue('ecod_domain/@ecod_domain_id');
+            elsif ( has_ecod_domain_node($domain)) { 
+                $domain_id = get_ecod_domain_id(get_ecod_domain_node($domain));
             }
             else {
                 die "?da $uid\n";
@@ -3958,7 +3896,6 @@ sub merge_new_ecod_pre_xml_to_old_ecod_xml {
         if (   $new_domain_assembly_seen{$old_domain_assembly}
             && $old_domain_assembly_range{$old_domain_assembly} eq $new_domain_assembly_range{$old_domain_assembly} )
         {
-#print "ndas: $old_domain_assembly $new_domain_assembly_seen{$old_domain_assembly} $old_domain_assembly_fid{$old_domain_assembly} $new_domain_assembly_fid{$old_domain_assembly}\n";
             if ( $old_domain_assembly_fid{$old_domain_assembly} eq $new_domain_assembly_fid{$old_domain_assembly} ) {
                 if ($DEBUG) {
                     print
@@ -4048,27 +3985,21 @@ sub merge_new_ecod_pre_xml_to_old_ecod_xml {
     );
     my %new_domain_da;
     print "Read new domains\n";
-    foreach my $domain ( $new_ecod_xml_doc->findnodes('//domain')->get_nodelist() ) {
+    foreach my $domain ( find_domain_nodes($new_ecod_xml_doc)) { 
 
         my $domain_id;
-        my $uid = $domain->findvalue('@uid');
-        if ( $domain->exists('scop_domain') ) {
-            $domain_id = $domain->findvalue('scop_domain/@scop_domain_id');
+        my $uid = get_uid($domain);
+        if ( has_scop_domain_node($domain)) { 
+            $domain_id = get_scop_domain_id(get_scop_domain_node($domain));
         }
-        elsif ( $domain->exists('ecod_domain') ) {
-            $domain_id = $domain->findvalue('ecod_domain/@ecod_domain_id');
+        elsif ( has_ecod_domain_node($domain)) { 
+            $domain_id = get_ecod_domain_id(get_ecod_domain_node($domain));
         }
         else {
             die "new: $uid?\n";
         }
 
-        my $f_id;
-        if ( $domain->parentNode->exists('@f_id') ) {
-            $f_id = $domain->parentNode->findvalue('@f_id');
-        }
-        elsif ( $domain->parentNode->parentNode->exists('@f_id') ) {
-            $f_id = $domain->parentNode->parentNode->findvalue('@f_id');
-        }
+        my $f_id = get_f_id_from_domain_node($domain);
         my $isAssemblyMember = 0;
         my $da_uid;
         my $da_type;
@@ -4109,10 +4040,10 @@ sub merge_new_ecod_pre_xml_to_old_ecod_xml {
     my %old_domain_derivedFrom_uid;
     my %old_domain_da;
     print "Read new domains\n";
-    foreach my $domain ( $old_ecod_xml_doc->findnodes('//domain') ) {
+    foreach my $domain ( find_domain_nodes($old_ecod_xml_doc)) { 
 
         my $domain_id;
-        my $uid = $domain->findvalue('@uid');
+        my $uid = get_uid($domain);
         if ( $domain->exists('scop_domain') ) {
             $domain_id = $domain->findvalue('scop_domain/@scop_domain_id');
         }
@@ -4404,6 +4335,8 @@ sub merge_new_ecod_pre_xml_to_old_ecod_xml {
 
     return $merge_xml_doc;
 }
+
+
 
 sub ecod_group_summary {
     my $sub = 'ecod_group_summary';
@@ -5005,6 +4938,38 @@ sub transfer_annotation {
 
 }
 
+sub get_primary_domain_id { 
+	if (has_primary_domain_id($_[0]) ) { 
+		my $n = get_primary_domain_node($_[0]);
+		if (has_scop_domain_node($n)) { 
+			return get_scop_domain_id(get_scop_domain_node($n))
+		}elsif(has_ecod_domain_node($n)){
+			return get_ecod_domain_node(get_ecod_domain_id($n));
+		}else{
+			return 'NA'
+		}
+	}
+}
+sub has_scop_domain_node { 
+	$_[0]->exists('scop_domain');
+}
+sub has_ecod_domain_node { 
+	$_[0]->exists('ecod_domain');
+}
+sub get_scop_domain_node {  
+	$_[0]->findnodes('scop_domain')->get_node(1);
+}
+sub get_ecod_domain_node { 
+	$_[0]->findnodes('ecod_domain')->get_node(1);
+}
+sub has_ecod_domain_node { 
+	$_[0]->exists('ecod_domain');
+}
+
+sub get_primary_domain_node { 
+	$_[0]->findnodes('domain[@primary="true"]')->get_node(1);
+}
+
 sub has_comment {
     if ( $_[1] eq 'alert_comment' ) {
         $_[0]->exists('alert_comment');
@@ -5016,6 +4981,7 @@ sub has_comment {
         $_[0]->exists('comment');
     }
 }
+
 
 sub get_comment_node {
     if ( $_[1] eq 'alert_comment' ) {
