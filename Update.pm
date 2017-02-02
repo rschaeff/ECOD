@@ -13,6 +13,7 @@ use Domains::PDBml;
 use Domains::Range;
 use Domains::SGE;
 use SQL::Util;
+use DBI;
 use ECOD::Reference;
 load_references();
 
@@ -26,6 +27,8 @@ our @EXPORT = (
     "&hmmer_annotation",                    "&convert_hmmer_to_pfam_annotation",
     "&calculate_divergence",                "&convert_hmmer_to_ecodf_annotation",
     "&convert_manual_range_to_seqid_range", "&convert_mc_manual_range_to_seqid_range",
+	"&compare_pdb_xml_doc_to_ecod",
+	"&dump_convert_interface_curation_domains_to_xml",
     "&determine_update_step",               "&generate_blast_library",
     "&assemble_hmmer_profile_library",      "&generate_distributable_files",
     "&assemble_hh_profile_library",         "&assemble_domain_fasta_library",
@@ -37,6 +40,7 @@ our @EXPORT = (
     "&generate_ecod_pdb_tarball",           "&generate_ecod_rep_list",
     "&generate_distributable_files",        "&generate_ecod_rep_list",
     "&ecodf_acc_to_pfam_acc",               "&get_pdbs_by_latest_week",
+	"&get_ecod_rep_domain_node",
     "&generate_ligand_annotation_jobs",     "&generate_pdb_structure_jobs",
     "&generate_image_jobs",                 "&ligand_annotation",
     "&build_chainwise",                     "&find_overlaps",
@@ -46,14 +50,17 @@ our @EXPORT = (
     "&fix_implicit_range_nodes",            "&apply_merge",
     "&apply_merge_v2",                      "&merge_new_ecod_pre_xml_to_old_ecod_xml",
     "&parse_ecod_txt_to_xml",               "&process_run_list_summary_to_ecod",
+	"&process_interface_curation_domains_to_ecod",
     "&convert_side_load_domains_to_xml",    "&process_side_load_domains_to_ecod",
     "&isMultiChainDomain",                  "&update_release_statistics",
     "&write_stats_gnuplot_script",          "&basic_ecod_stats",
+	"&update_dali_summ_cache"
 );
 
 my $DOMAIN_IMAGE_EXE = '/data/ecod/domain_image_new.py';
 if ( !-f $DOMAIN_IMAGE_EXE ) { die "ERROR! Could not find domain image exe $DOMAIN_IMAGE_EXE\n"; }
-my $PYMOL_EXE = '/home/rschaeff/bin/pymol/pymol';
+#my $PYMOL_EXE = '/home/rschaeff/bin/pymol/pymol';
+my $PYMOL_EXE = '/home/rschaeff/pymol/pymol';
 if ( !-f $PYMOL_EXE ) { die "ERROR! Could not find pymol image exe $PYMOL_EXE\n"; }
 my $XML_PDB_EXE = '/data/ecod/database_versions/bin/xml_pdb_process_v3.pl';
 if ( !-f $XML_PDB_EXE ) { die "ERROR! Could not find pdb formatter $XML_PDB_EXE\n"; }
@@ -69,7 +76,8 @@ my $HHMAKE_EXE = '/home/rschaeff/hhsuite-2.0.15-linux-x86_64/bin/hhmake';
 if ( !-f $HHMAKE_EXE ) { die "ERROR! HHmake exe not found $HHMAKE_EXE\n" }
 my $MAKEBLAST_EXE = "/usr1/ncbi-blast-2.2.25+/bin/makeblastdb";
 if ( !-f $MAKEBLAST_EXE ) { die "ERROR! makeblastdb not found $MAKEBLAST_EXE\n" }
-my $HMMSCAN_EXE = "/usr1/local/bin/hmmscan";
+#my $HMMSCAN_EXE = "/usr1/local/bin/hmmscan";
+my $HMMSCAN_EXE = '/data/ecod/hmmer-3.1b2/binaries/hmmscan';
 if ( !-f $HMMSCAN_EXE ) { die "ERROR! hmmscan not found $HMMSCAN_EXE\n"; }
 my $SINGLE_LIGAND_ANNOT_EXE = '/data/ecod/database_versions/bin/single_annotate_ecod_ligand.pl';
 if ( !-f $SINGLE_LIGAND_ANNOT_EXE ) { die "ERROR! File not found: $SINGLE_LIGAND_ANNOT_EXE\n" }
@@ -77,13 +85,13 @@ my $HH_LIB = '/home/rschaeff/hhsuite-2.0.15-linux-x86_x64/lib';
 
 #HMM parameters need to be offloaded, this is bad
 my $HMM_LABEL = 'ECODf';
-
-my $HMM_VNUM = 'v28';
+my $HMM_VNUM = 'v30';
 my $HMM_LIB  = "/data/ecodf/ecodf.$HMM_VNUM.hmm";
 if ( !-f $HMM_LIB ) { die "ERROR! HMM lib not found: $HMM_LIB\n" }
+my $ECODF_SQL = 1;
 
 my $ECODF_XML_FN = "/data/ecodf/ecodf.$HMM_VNUM.xml";
-if ( !-f $ECODF_XML_FN ) { die "Could not find ECODf xml $ECODF_XML_FN\n" }
+#	if ( !-f $ECODF_XML_FN ) { die "Could not find ECODf xml $ECODF_XML_FN\n" }
 
 my $DEBUG = 0;
 
@@ -110,6 +118,53 @@ my $PSIPRED_DATA_DIR = '/usr1/psipred/data';
 my $DOMAIN_DATA_DIR  = '/data/ecod/domain_data';
 my $CHAIN_DATA_DIR   = '/data/ecod/chain_data';
 
+sub get_manual_domain_uids { 
+	my ($ecod_xml_doc) = @_;
+	my %uids;
+	foreach my $manual_domain (find_manual_domain_nodes($ecod_xml_doc)) { 
+		my ($uid, $ecod_domain_id) = get_ids($manual_domain);
+		$uids{$uid}++;
+	}
+	return \%uids;
+}
+
+sub update_dali_summ_rep_cache { 
+	my $sub = 'update_dali_summ_rep_cache';
+	my ($old_rep_cache_fn, $ecod_xml_doc, $version) = @_;
+
+	my $rep_cache = retrieve($old_rep_cache_fn);
+
+	printf "#$sub: Found %i items in cache\n", scalar keys %$rep_cache;
+
+	my $man_uids = get_manual_domain_uids($ecod_xml_doc);
+	printf "#Found %i items in ecod xml\n", scalar keys %$man_uids;
+	my %domains;
+	foreach my $domain_node (find_domain_nodes($ecod_xml_doc)) { 
+		my ($uid, $ecod_domain_id) = get_ids($domain_node);
+		$domains{$uid} = $domain_node;
+	}
+
+	foreach my $uid (keys %$man_uids) { 
+		my ($pdb_id, $chain_id) = get_pdb_chain($domains{$uid});	
+		next if $chain_id eq '.';
+		if (!exists $$rep_cache{$uid}) { 
+			#print "ADD $uid\n";
+			add_to_rep_cache($uid, $rep_cache, \%domains);
+		}
+	}
+	foreach my $uid (keys %$rep_cache) { 
+		if (!exists $$man_uids{$uid}) { 
+			#print "DROP $uid\n";
+			drop_from_rep_cache($uid, $rep_cache);
+		}
+	}
+
+	my $cache_fn = "$version.dali_summ.rep_cache";
+	if (!nstore($rep_cache, $cache_fn)) { 
+		die "ERROR! Could not store rep_stats in $cache_fn\n";
+	}
+
+}
 sub basic_ecod_stats {
     my $sub = 'basic_ecod_stats';
     my ( $ref_xml_fn, $ref_version ) = @_;
@@ -421,32 +476,50 @@ sub update_release_statistics {
 sub ecodf_acc_to_pfam_acc {
     my $sub = 'ecodf_acc_to_pfam_acc';
 
-    my $ecodf_xml_fn = "/data/ecodf/ecodf.$HMM_VNUM.xml";
-    if ( !-f $ecodf_xml_fn ) {
-        die "ERROR! $sub: Could not find ECODf file $ecodf_xml_fn\n";
-    }
-    my $ecodf_xml_doc = xml_open($ecodf_xml_fn);
+	my $ECODF_SQL = 1;
+	my %ecodf2pfam_accs;
+	if ($ECODF_SQL) { 
+		my $dbh = db_connect('ecod_curation');
+		my $sth = $dbh->prepare('SELECT ecodf_acc, pfam_acc FROM ecodf_family_list');
+		$sth->execute();
 
-    my %ecodf2pfam_accs;
-    foreach my $family_node ( $ecodf_xml_doc->findnodes('//family') ) {
-        my $ecodf_acc = $family_node->findvalue('@ecodf_acc');
-        $ecodf_acc =~ /(EF\d+)\./;
-        $ecodf_acc = $1;
-        if ( $family_node->exists('@pfam_acc') ) {
-            my $pfam_acc = $family_node->findvalue('@pfam_acc');
-            $pfam_acc =~ /(PF\d+)\./;
-            $pfam_acc = $1;
-            $ecodf2pfam_accs{$ecodf_acc} = $pfam_acc;
-        }
-    }
+		while (my $row_aref = $sth->fetchrow_arrayref() ) { 
+			my $ecodf_acc 	= $$row_aref[0];
+			$ecodf_acc =~ /(EF\d+)\./;
+			$ecodf_acc = $1;
+			my $pfam_acc 	= $$row_aref[1];
+			if ($pfam_acc && $pfam_acc =~ /(PF\d+)\./) { 
+				$pfam_acc = $1;
+				$ecodf2pfam_accs{$ecodf_acc} = $pfam_acc;
+			}
+		}
+	}else{
+		my $ecodf_xml_fn = "/data/ecodf/ecodf.$HMM_VNUM.xml";
+		if ( !-f $ecodf_xml_fn ) {
+			die "ERROR! $sub: Could not find ECODf file $ecodf_xml_fn\n";
+		}
+		my $ecodf_xml_doc = xml_open($ecodf_xml_fn);
+
+		foreach my $family_node ( $ecodf_xml_doc->findnodes('//family') ) {
+			my $ecodf_acc = $family_node->findvalue('@ecodf_acc');
+			$ecodf_acc =~ /(EF\d+)\./;
+			$ecodf_acc = $1;
+			if ( $family_node->exists('@pfam_acc') ) {
+				my $pfam_acc = $family_node->findvalue('@pfam_acc');
+				$pfam_acc =~ /(PF\d+)\./;
+				$pfam_acc = $1;
+				$ecodf2pfam_accs{$ecodf_acc} = $pfam_acc;
+			}
+		}
+	}
+	#printf "DEBUG $sub: %i\n", scalar keys %ecodf2pfam_accs;
     return \%ecodf2pfam_accs;
 }
-my $FGROUP_CLUSTER_METHOD = 'blastclust';
 
 sub generate_distributable_files {
     my $sub = 'generate_distributable_files';
 
-    my ( $version, $master_ecod_xml, $tag ) = @_;
+    my ( $version, $master_ecod_xml, $tag, $method ) = @_;
     print "$sub: $version\n";
     my $recent_week = $master_ecod_xml->findvalue('//@mostRecentWeek');
 
@@ -465,10 +538,11 @@ sub generate_distributable_files {
     if ($tag) {
         $current_ecod_domain_dump = "$top_dir/ecod.$version.$tag.domains.txt";
     }
+
     my %pf_lookup;
+	my $FGROUP_CLUSTER_METHOD = 'blastclust';
     if ( !-f $current_ecod_domain_dump ) {
-        generate_ecod_domain_dump( $ecod_xml_doc, $current_ecod_domain_dump, $version, \%pf_lookup, $tag,
-            $FGROUP_CLUSTER_METHOD );
+        generate_ecod_domain_dump( $ecod_xml_doc, $current_ecod_domain_dump, $version, \%pf_lookup, $tag, $FGROUP_CLUSTER_METHOD );
         printf "keys %i\n", scalar keys %pf_lookup;
     }
 
@@ -523,13 +597,14 @@ sub generate_ecod_domain_dump {
     if ($use_pfam_acc) {
         $ecodf_translate = ecodf_acc_to_pfam_acc();
     }
-    if ( !$tag ) { $tag = 'none' }
+    if ( $tag !~ /F40|F70|F99/  ) { $tag = 'none' }
     my %nodes = (
         'none' => \&find_strict_domain_nodes,
         F40    => \&find_strict_domain_reps,
         F70    => \&find_strict_domain_reps,
         F99    => \&find_strict_domain_reps,
     );
+	print "t: $tag\n";
 
     #Header needs to be moved outside of code
     print OUT "#$output_fn\n";
@@ -1007,7 +1082,7 @@ sub generate_dali_summ_cache {
 
         print "$uid $ecod_domain_id\n";
 
-        next if isObsolete($rep_domain_node);
+        next if is_obsolete($rep_domain_node);
 
         my $seqid_range = get_seqid_range($rep_domain_node);
 
@@ -1120,7 +1195,9 @@ sub update_pdb_doc {
 
         $pdb_ln =~ /(\w{4})-noatom.xml/;
         my $pdb = $1;
+		my $two = substr($pdb, 1, 2);
         if ( $old_pdbs{$pdb} ) { next }
+		my $pdbml = pdbml_load($pdb);
         my ( $chains, $chain_seqid_aref, $chain_struct_seqid_aref, $chain_pdbnum_href ) = pdbml_fetch_chains($pdb);
 
         my $pdb_node = $pdb_chain_doc->createElement('pdb');
@@ -1133,14 +1210,37 @@ sub update_pdb_doc {
         $pdb_node->setAttribute( 'method', $method );
 
         foreach my $chain (@$chains) {
+
+			my $pc = $pdb . "_" . $chain; 
+
+			my $residues_fn = "/data/ecod/chain_data/$two/$pc/$pc.residues.xml";
+			if (! -d "/data/ecod/chain_data/$two/$pc") { 
+				mkdir("/data/ecod/chain_data/$two/$pc");
+			}
+			generate_residues_ref_xml($pdb, $chain, $pdbml, $residues_fn);
+
             my $chain_node = $pdb_chain_doc->createElement('chain');
             $chain_node->setAttribute( 'chain_id', $chain );
             $pdb_node->appendChild($chain_node);
+
+			if (-f $residues_fn) { 
+				my $residues_xml_doc = xml_open($residues_fn);
+				my $query_range = $residues_xml_doc->findvalue('//query_range');
+				$query_range = scopify_range($query_range, $chain);
+				$chain_node->appendTextChild('query_range', $query_range);
+			}else{
+				warn "WARNING! No residues file for $pc\n";
+				next;
+			}
 
             my $seqid_range_node = $pdb_chain_doc->createElement('seqid_range');
             my $range_node       = $pdb_chain_doc->createElement('range');
 
             my ( $seqid_range, $range );
+			if (!exists $$chain_struct_seqid_aref{$chain}) { 
+				warn "WARNING! No chain $chain in pdb $pdb, despite listing?\n";
+				next;
+			}
             if ( scalar( @{ $$chain_struct_seqid_aref{$chain} } ) == 0 ) {
                 $seqid_range_node->setAttribute( 'unstructured', 'true' );
                 $range_node->setAttribute( 'unstructured', 'true' );
@@ -1289,7 +1389,8 @@ sub compare_pdb_xml_doc_to_ecod {
 
             foreach my $chain_node ( $pdb_node->findnodes('chain')->get_nodelist() ) {
                 my $chain_id    = $chain_node->findvalue('@chain_id');
-                my $seqid_range = $chain_node->findvalue('seqid_range');
+                #my $seqid_range = $chain_node->findvalue('seqid_range');
+				my $seqid_range = $chain_node->findvalue('query_range');
                 if ( $skip{$pdb_id}{$chain_id} ) { next }
                 if ( !$chains{$pdb_id}{$chain_id} && $seqid_range =~ /\d+\-/ ) {
 
@@ -1339,6 +1440,11 @@ sub compare_pdb_xml_doc_to_ecod {
                         $job_node->appendTextChild( 'repair_type', 'low_coverage' );
                         $job_node->setAttribute( 'missing_res', $total_residues - $residue_coverage );
 
+						range_exclude( $chains{$pdb_id}{$chain_id}, $range_aref);
+
+						my $missing_range = rangify(@$range_aref);
+						$job_node->appendTextChild('missing_range', $missing_range);
+						
                         my $mode_node = $compare_repair_xml_doc->createElement('mode');
                         $mode_node->setAttribute( 'input', 'struct_seqid' );
                         $mode_node->appendTextNode('seq_iter');
@@ -1680,8 +1786,8 @@ sub generate_ligand_annotation_jobs {
 
 		my ($pdb, $chain) = get_pdb_chain($domain_node);
 
-		next if isObsolete($domain_node);
-		next unless has_ligand_annotation($domain_node);
+		next if is_obsolete($domain_node);
+		next if has_ligand_annotation($domain_node);
 
         my $domain_seqid_range = get_seqid_range($domain_node);
 
@@ -1782,7 +1888,6 @@ sub generate_image_jobs {
 
 		my ($pdb, $chain) = get_pdb_chain($domain_node);
 
-        my $pdb_range;
 		my $pdb_range = get_pdb_range($domain_node);
 	  	my $run_str = "$PYMOL_EXE -qc $DOMAIN_IMAGE_EXE -- $uid $pdb $pdb_range ";
 
@@ -1818,7 +1923,7 @@ sub generate_pdb_structure_jobs {
     my ( $ecod_xml_doc, $mode ) = @_;
 
     my @jobs;
-    foreach my $domain_node ( find_domain_nodes($ecod_xml_doc)) ) {
+    foreach my $domain_node ( find_domain_nodes($ecod_xml_doc) ) {
 
         #if ($domain_node->findvalue('structure/@structure_obsolete') eq 'true') { next }
 
@@ -1876,6 +1981,158 @@ sub generate_pdb_structure_jobs {
     }
     return \@jobs;
 }
+
+sub dump_convert_interface_curation_domains_to_xml { 
+	my $sub = 'convert_interface_curation_domains_to_xml';
+
+	my ($ecod_xml_doc, $dbname, $version) = @_;
+
+	my %known_domains;
+	foreach my $domain_node (find_domain_nodes($ecod_xml_doc)) { 
+		my ($uid, $ecod_domain_id) = get_ids($domain_node);
+		$known_domains{$uid} = $ecod_domain_id;
+	}
+
+	my $dbh = db_connect($dbname);
+
+	my $interface_curation_sth = $dbh->prepare(sql_dump_interface_curation());
+	$interface_curation_sth->execute();
+	my $i = 0;
+	my @domains;
+	while (my $row_aref = $interface_curation_sth->fetchrow_arrayref() ) { 
+		my $uid			 	= $$row_aref[0];
+		$known_domains{$uid} and next;
+		
+		my $source		 	= $$row_aref[1];
+		my $source_id	 	= $$row_aref[2];
+		my $is_rep		 	= $$row_aref[3];
+		my $chain_id		= $$row_aref[4];
+		my $x_id			= $$row_aref[5];
+		my $h_id			= $$row_aref[6];
+		my $t_id			= $$row_aref[7];
+		my $ref_uid			= $$row_aref[8];
+		my $seqid_range 	= $$row_aref[9];
+
+		$domains[$i]{uid}			= $uid;
+		$domains[$i]{pdb_id} 		= $source_id;
+		#$domains[$i]{chain_id} 		= $chain_id;
+		$domains[$i]{seqid_range}	= $seqid_range;
+		$domains[$i]{hit_domain_uid} = $ref_uid;
+		$i++;
+	}
+
+	my ($domain_xml_doc, $domain_doc_node) = xml_create('domain_doc');
+
+	my $domain_list_node = $domain_xml_doc->createElement('domain_list');
+	$domain_doc_node->appendChild($domain_list_node);
+
+
+	my %seen;
+	for ( my $i = 0 ; $i < scalar(@domains) ; $i++ ) {
+
+		my $domain_node = $domain_xml_doc->createElement('domain');
+
+		$domain_node->setAttribute( 'manual_rep',   'false' );
+		$domain_node->setAttribute( 'interface_side_load', 'true' );
+
+		$domain_list_node->appendChild($domain_node);
+
+		my $ref 	= $version;
+		my $pdb_id   = $domains[$i]{pdb_id};
+		#my $chain_id = $domains[$i]{chain_id};
+		my $seqid_range = $domains[$i]{seqid_range};
+
+		my $chain_id = determine_chain_id($seqid_range);
+
+		print "$pdb_id/$chain_id\n";
+
+		my $pdb_chain = lc($pdb_id) . $chain_id;
+		$seen{$pdb_chain}++;
+		my $ecod_domain_id = 'e' . lc($pdb_id) . $chain_id . $seen{$pdb_chain};
+
+		my $hit_uid     = sprintf "%09i", $domains[$i]{hit_domain_uid};
+		my $uid 		= sprintf "%09i", $domains[$i]{uid};
+		$domain_node->setAttribute( 'uid', $uid );
+		my $hit_domain_id;
+		if (exists $known_domains{$hit_uid}) { 
+			$hit_domain_id   = $known_domains{$hit_uid};
+		}else{ 
+			warn "ERROR! No ecod domain id for $hit_uid\n";
+			next;
+		}
+
+		my $ecod_domain_node = $domain_xml_doc->createElement('ecod_domain');
+		$ecod_domain_node->setAttribute( 'ecod_domain_id', $ecod_domain_id );
+		$ecod_domain_node->setAttribute( 'reference',      $ref );
+		$domain_node->setAttribute( 'manual_range', 'true' );
+
+		my $structure_node = $domain_xml_doc->createElement('structure');
+		$structure_node->setAttribute( 'db',                   'PDB' );
+		$structure_node->setAttribute( 'pdb_id',               $pdb_id );
+		$structure_node->setAttribute( 'chain_id',             $chain_id );
+		$structure_node->setAttribute( 'chain_case_ambiguous', 'false' );
+
+		my ($domain_seqid_aref, $domain_chain_aref) = multi_chain_range_expand($seqid_range);
+		my @segs = split(/,/, $seqid_range);
+		my @c;
+		foreach my $s (@segs) { $s =~ /(.+):/; push (@c, $1)}
+		my ($ref_seqid_aref, $ref_struct_seqid_aref, $pdbnum_href, $ref_chain_aref, $ref_struct_chain_aref) = pdbml_mc_seq_parse($pdb_id, \@c);
+		my $pdb_range = multi_chain_pdb_rangify($domain_seqid_aref, $pdbnum_href, $domain_chain_aref);
+
+
+		my $manual_range_node = $domain_xml_doc->createElement('manual_range');
+		$manual_range_node->appendTextNode($pdb_range);
+		my $seqid_range_node = $domain_xml_doc->createElement('seqid_range');
+		$seqid_range_node->appendTextNode($seqid_range);
+		my $range_node = $domain_xml_doc->createElement('range');
+		$range_node->appendTextNode($pdb_range);
+
+		$domain_node->appendChild($ecod_domain_node);
+		$domain_node->appendChild($manual_range_node);
+		$domain_node->appendChild($seqid_range_node);
+		$domain_node->appendChild($range_node);
+		$domain_node->appendChild($structure_node);
+
+		if ( $hit_domain_id =~ /(e\w{4}.+\d+)/ ) {
+			my $hit_ecod_domain_id = $1;
+			my $hit_domain_node    = $domain_xml_doc->createElement('ecod_representative_domain');
+			$hit_domain_node->setAttribute( 'ecod_domain_id', $hit_ecod_domain_id );
+			$hit_domain_node->setAttribute( 'uid',            sprintf "%09i", $hit_uid );
+			$hit_domain_node->setAttribute( 'reference',      $ref );
+			$domain_node->appendChild($hit_domain_node);
+		}
+		elsif ( $hit_domain_id =~ /(d\w{4}.+(\d+|_))/ ) {
+			my $hit_scop_domain_id = $1;
+			my $hit_domain_node    = $domain_xml_doc->createElement('scop_representative_domain');
+			$hit_domain_node->setAttribute( 'scop_domain_id', $hit_scop_domain_id );
+			$hit_domain_node->setAttribute( 'reference',      $ref );
+			$domain_node->appendChild($hit_domain_node);
+		}
+		else {
+			die "ERROR! hit domain regexp fail on $hit_domain_id\n";
+		}
+
+	}
+	return $domain_xml_doc
+}
+sub determine_chain_id { 
+	my $range = $_[0];
+	my @segs = split(/\,/, $range);
+	my %c;
+	foreach my $s (@segs) { 
+		$s =~ /(.)+:/;
+		$c{$1}++;
+	}
+	if (scalar keys %c == 1) { 
+		my @c = keys %c;
+		return $c[0];
+	}else{
+		return '.';
+	}
+
+
+}
+
 
 sub convert_side_load_domains_to_xml {
     my $sub = 'convert_side_load_domains_to_xml';
@@ -1984,6 +2241,86 @@ sub convert_side_load_domains_to_xml {
     return $domain_xml_doc;
 }
 
+sub process_interface_curation_domains_to_ecod { 
+	my $sub = 'process_interface_curation_domains_to_ecod';
+
+	my ($ecod_xml_doc, $interface_curation_xml_doc) = @_;
+
+	my %seen_uids;
+	my %seen_domain_ids;
+	my %seen_domain_nodes;
+	my %interface_side_load;
+	my %chain_ranges;
+	foreach my $ecod_domain_node (find_domain_nodes($ecod_xml_doc)) { 
+		my ($uid, $ecod_domain_id) = get_ids($ecod_domain_node);
+		my $seqid_range = get_seqid_range($ecod_domain_node);
+		$seen_uids{$uid}++;
+		$seen_domain_ids{$ecod_domain_id}++;
+		$seen_domain_nodes{$uid} = $ecod_domain_node;
+
+		if ($ecod_domain_node->findvalue('@interface_side_load') eq 'true') { 
+			$interface_side_load{$uid}++;
+		}
+
+		my ($pdb_id, $chain_id) = get_pdb_chain($ecod_domain_node);
+
+		push ( @{ $chain_ranges{$pdb_id}{$chain_id}}, $seqid_range );
+
+	}
+
+	my $size = $interface_curation_xml_doc->findnodes('.//domain')->size();
+
+	INTERFACE_DOMAIN:
+	foreach my $interface_domain_node (find_domain_nodes($interface_curation_xml_doc)) { 
+		#my $ecod_domain_id = get_ecod_domain_id($interface_domain_node);
+		my $uid = get_uid($interface_domain_node);
+
+		if ($interface_side_load{$uid}) { next } 
+			
+		my ($pdb_id, $chain_id) = get_pdb_chain($interface_domain_node);
+
+		my $seqid_range = $interface_domain_node->findvalue('seqid_range');
+		my $seqid_range_aref = range_expand($seqid_range);
+
+		foreach my $ref_range_str (@{$chain_ranges{$pdb_id}{$chain_id}}) { 
+			my ($ref_range, $ref_chain) = scop_range_split($ref_range_str);
+			my $ref_range_aref = range_expand($ref_range);
+			if ( residue_coverage($ref_range_aref, $seqid_range_aref) > 25 ) { 
+				next INTERFACE_DOMAIN;
+			}
+		}
+
+		my $dnum = 1;
+		my $ecod_domain_id = "e" . $pdb_id . $chain_id . $dnum;
+
+		while ( $seen_domain_ids{$ecod_domain_id} ) { 
+			print "WARNING! ID collision on domain id $ecod_domain_id\n";
+				$dnum++;
+				$ecod_domain_id = "e" . $pdb_id . $chain_id . $dnum;
+		}
+		$seen_domain_ids{$ecod_domain_id}++;
+
+		if (!$interface_domain_node->exists('@ecod_domain_id')) { 
+			$interface_domain_node->setAttribute('ecod_domain_id', $ecod_domain_id);
+		}
+		
+		if ($interface_domain_node->exists('ecod_representative_domain/@ecod_domain_id')) { 
+			my $hit_ecod_domain_uid = $interface_domain_node->findvalue('ecod_representative_domain/@uid');
+			my $ecod_hit_domain_node = $seen_domain_nodes{$hit_ecod_domain_uid};
+			my $f_node = get_f_node_from_domain_node($ecod_hit_domain_node);
+			if ($f_node) { 
+				$f_node->appendChild($interface_domain_node);
+			}else{
+				warn "WARNING! $hit_ecod_domain_uid does not have an F-node\n";
+			}
+		}else{
+			warn "WARNING! Could not find F-group from domain $uid\n";
+		}
+	}
+
+
+}
+
 sub process_side_load_domains_to_ecod {
     my $sub = 'process_side_load_domains_to_xml';
 
@@ -1999,7 +2336,7 @@ sub process_side_load_domains_to_ecod {
     my %chain_ranges;
     my %yx_side_load;
 
-    foreach my $ecod_domain_node ( find_domain_nodes($ecod_xml_doc)) ) {
+    foreach my $ecod_domain_node ( find_domain_nodes($ecod_xml_doc) ) {
         my $ecod_domain_id = $ecod_domain_node->findvalue('@ecod_domain_id');
         my $seqid_range = get_seqid_range($ecod_domain_node);
 
@@ -2025,7 +2362,7 @@ sub process_side_load_domains_to_ecod {
             my $ecod_domain_id = $yx_domain_node->findvalue('ecod_domain/@ecod_domain_id');
             if ( $yx_side_load{$ecod_domain_id} ) { next }
 
-			my ($pdb_id, $chain_id) = get_pdb_chain($domain_node);
+			my ($pdb_id, $chain_id) = get_pdb_chain($yx_domain_node);
 
             #my $uid = $yx_domain_node->findvalue('@uid');
 
@@ -2144,7 +2481,7 @@ sub process_run_list_summary_to_ecod {
     my %new_ecod_ids;
     my %dict_ranges;
     my %chain_ranges;
-    foreach my $dict_d_node ( find_domain_nodes($ecod_xml_doc)) ) {
+    foreach my $dict_d_node ( find_domain_nodes($ecod_xml_doc) ) {
         my $uid = sprintf "%09i", $dict_d_node->findvalue('@uid');
         if ( !$dict_d_node->exists('@ecod_domain_id') ) {
             print "WARNING! Missing ecod domain id for $uid\n";
@@ -3246,7 +3583,7 @@ sub merge_new_ecod_pre_xml_to_old_ecod_xml {
 
         my $arch_id   = get_arch_id($arch);
 		my $arch_name = has_arch_name($arch) ? get_arch_name($arch) : 'NA';
-		my $arch_commment = has_arch_comment($arch) ? get_arch_comment($arch) : 'NA';
+		my $arch_comment = has_arch_comment($arch) ? get_arch_comment($arch) : 'NA';
 		my $arch_ordinal = has_arch_ordinal($arch) ? get_arch_ordinal($arch) : 'NA';
 
         $old_arch_seen{$arch_id}++;
@@ -3263,7 +3600,7 @@ sub merge_new_ecod_pre_xml_to_old_ecod_xml {
 
         my $arch_id   = get_arch_id($arch);
 		my $arch_name = has_arch_name($arch) ? get_arch_name($arch) : 'NA';
-		my $arch_commment = has_arch_comment($arch) ? get_arch_comment($arch) : 'NA';
+		my $arch_comment = has_arch_comment($arch) ? get_arch_comment($arch) : 'NA';
 		my $arch_ordinal = has_arch_ordinal($arch) ? get_arch_ordinal($arch) : 'NA';
 
 		$new_arch_seen{$arch_id}++;
@@ -3332,13 +3669,14 @@ sub merge_new_ecod_pre_xml_to_old_ecod_xml {
     my %new_x_arch_comment;
     print "Read old x\n";
 
-    foreach my $x_group ( find_x_group_nodes($old_ecod_xml_doc)) ) {
+    foreach my $x_group ( find_x_group_nodes($old_ecod_xml_doc) ) {
 
         my $x_id   = get_x_id($x_group);
 		my $x_name = has_name($x_group) ? get_name($x_group) : 'NA';
         #my $x_arch = $x_group->findvalue('@architecture');
 
-        my $x_arch = has_arch_name($x_group->parentNode) ? get_arch_name($x_group)->parentNode : 'NA';
+        my $x_arch = has_arch_name($x_group->parentNode) ? get_arch_name($x_group->parentNode) : 'NA';
+		my $x_arch_id = has_arch_id($x_group->parentNode) ? get_arch_id($x_group->parentNode) : 'NA';
         my $x_arch_comment = has_arch_comment($x_group) ? get_arch_comment($x_group) : 'NA';
 		my $x_ordinal = has_x_ordinal($x_group) ? get_x_ordinal($x_group) : 'NaN';
 
@@ -3361,7 +3699,7 @@ sub merge_new_ecod_pre_xml_to_old_ecod_xml {
         my $x_arch         = get_arch_name($x_group->parentNode);
         my $x_arch_id      = get_arch_id($x_group->parentNode);
         my $x_arch_comment 	= has_arch_comment($x_group) ? get_arch_comment($x_group) : 'NA';
-        my $x_ordinal 		= has_x_ordinal($x_group) ? get_x_ordinal($x_group) 'NaN';
+        my $x_ordinal 		= has_x_ordinal($x_group) ? get_x_ordinal($x_group) : 'NaN';
 
         $new_x_seen{$x_id}++;
         $new_x_name{$x_id}         = $x_name;
@@ -3415,13 +3753,13 @@ sub merge_new_ecod_pre_xml_to_old_ecod_xml {
             $modify_x_group_node->setAttribute( 'type',     'x_group' );
             $modify_x_group_node->setAttribute( 'x_id',     $old_x_id );
             $modify_x_group_node->setAttribute( 'mod_type', 'ordinal_shift' );
-            if ( $old_x_ordinal{$old_x_id} ) {
+            if ( exists $old_x_ordinal{$old_x_id} ) {
                 $modify_x_group_node->setAttribute( 'old_ordinal', $old_x_ordinal{$old_x_id} );
             }
             else {
                 print "WARNING! No old x_ordinal for $old_x_id\n";
             }
-            if ( $new_x_ordinal{$old_x_id} ) {
+            if ( exists $new_x_ordinal{$old_x_id} ) {
                 $modify_x_group_node->setAttribute( 'new_ordinal', $new_x_ordinal{$old_x_id} );
             }
             else {
@@ -3445,7 +3783,7 @@ sub merge_new_ecod_pre_xml_to_old_ecod_xml {
 
             my $old_arch_name_node = $merge_xml_doc->createElement('arch_name');
             $old_arch_name_node->setAttribute( 'version', $old_version );
-            if ( $old_x_arch_id{$old_x_id} ) {
+            if ( exists $old_x_arch_id{$old_x_id} ) {
                 $old_arch_name_node->setAttribute( 'arch_id', $old_x_arch_id{$old_x_id} );
             }
             else {
@@ -3456,13 +3794,13 @@ sub merge_new_ecod_pre_xml_to_old_ecod_xml {
 
             my $new_arch_name_node = $merge_xml_doc->createElement('arch_name');
             $new_arch_name_node->setAttribute( 'version', $new_version );
-            if ( $new_x_arch_id{$old_x_id} ) {
+            if ( exists $new_x_arch_id{$old_x_id} ) {
                 $new_arch_name_node->setAttribute( 'arch_id', $new_x_arch_id{$old_x_id} );
             }
             else {
                 print "WARNING! No arch_id for $old_x_id\n";
             }
-            if ( $new_x_arch{$old_x_id} ) {
+            if ( exists $new_x_arch{$old_x_id} ) {
                 $new_arch_name_node->appendTextNode( $new_x_arch{$old_x_id} );
             }
             else {
@@ -3584,13 +3922,13 @@ sub merge_new_ecod_pre_xml_to_old_ecod_xml {
             $modify_h_group_node->setAttribute( 'type',     'h_group' );
             $modify_h_group_node->setAttribute( 'h_id',     $old_h_id );
             $modify_h_group_node->setAttribute( 'mod_type', 'ordinal_shift' );
-            if ( $old_h_ordinal{$old_h_id} ) {
+            if ( exists $old_h_ordinal{$old_h_id} ) {
                 $modify_h_group_node->setAttribute( 'old_ordinal', $old_h_ordinal{$old_h_id} );
             }
             else {
                 print "WARNING! No old h_ordinal for $old_h_id\n";
             }
-            if ( $new_h_ordinal{$old_h_id} ) {
+            if ( exists $new_h_ordinal{$old_h_id} ) {
                 $modify_h_group_node->setAttribute( 'new_ordinal', $new_h_ordinal{$old_h_id} );
             }
             else {
@@ -3705,13 +4043,13 @@ sub merge_new_ecod_pre_xml_to_old_ecod_xml {
             $modify_f_group_node->setAttribute( 'type',     'f_group' );
             $modify_f_group_node->setAttribute( 'f_id',     $old_f_id );
             $modify_f_group_node->setAttribute( 'mod_type', 'ordinal_shift' );
-            if ( $old_f_ordinal{$old_f_id} ) {
+            if ( exists $old_f_ordinal{$old_f_id} ) {
                 $modify_f_group_node->setAttribute( 'old_ordinal', $old_f_ordinal{$old_f_id} );
             }
             else {
                 print "WARNING! No old f_ordinal for $old_f_id\n";
             }
-            if ( $new_f_ordinal{$old_f_id} ) {
+            if ( exists $new_f_ordinal{$old_f_id} ) {
                 $modify_f_group_node->setAttribute( 'new_ordinal', $new_f_ordinal{$old_f_id} );
             }
             else {
@@ -3775,7 +4113,7 @@ sub merge_new_ecod_pre_xml_to_old_ecod_xml {
         foreach my $domain ( find_domain_nodes($domain_assembly)) { 
             my $domain_id;
             if ( has_scop_domain_node($domain)) { 
-                $domain_id = get_scop_domain_id(get_scop_domain_node($domain);
+                $domain_id = get_scop_domain_id(get_scop_domain_node($domain));
             }
             elsif ( has_ecod_domain_node($domain)  ) {
                 $domain_id = get_ecod_domain_id(get_ecod_domain_node($domain));
@@ -3897,7 +4235,7 @@ sub merge_new_ecod_pre_xml_to_old_ecod_xml {
             && $old_domain_assembly_range{$old_domain_assembly} eq $new_domain_assembly_range{$old_domain_assembly} )
         {
             if ( $old_domain_assembly_fid{$old_domain_assembly} eq $new_domain_assembly_fid{$old_domain_assembly} ) {
-                if ($DEBUG) {
+                if ($DEBUG > 1) {
                     print
 "DOMAIN_ASSEMBLY_CORRESPONDENCE $old_domain_assembly $new_domain_assembly_uid{$old_domain_assembly} $new_domain_assembly_range{$old_domain_assembly} $old_domain_assembly_range{$old_domain_assembly}\n";
                 }
@@ -4030,7 +4368,6 @@ sub merge_new_ecod_pre_xml_to_old_ecod_xml {
         $new_domain_type{$hash}     = $type;
 
     }
-
     my (
         %old_domain_seen,    %old_domain_parent, %old_domain_range,      %old_domain_uid,
         %old_domain_type,    %old_domain_unhash, %old_domain_parent_uid, %old_domain_fid,
@@ -4044,11 +4381,11 @@ sub merge_new_ecod_pre_xml_to_old_ecod_xml {
 
         my $domain_id;
         my $uid = get_uid($domain);
-        if ( $domain->exists('scop_domain') ) {
-            $domain_id = $domain->findvalue('scop_domain/@scop_domain_id');
+        if ( has_scop_domain_node($domain)) { 
+            $domain_id = get_scop_domain_id(get_scop_domain_node($domain));
         }
-        elsif ( $domain->exists('ecod_domain') ) {
-            $domain_id = $domain->findvalue('ecod_domain/@ecod_domain_id');
+        elsif ( has_ecod_domain_node($domain)) { 
+            $domain_id = get_ecod_domain_id(get_ecod_domain_node($domain));
             $old_domain_domainid2uid{$domain_id} = $uid;
         }
         else {
@@ -4102,30 +4439,15 @@ sub merge_new_ecod_pre_xml_to_old_ecod_xml {
         }
         my $hash = $domain_id . $range;
 
-        my $f_id;
-        if ( $domain->parentNode->exists('@f_id') ) {
-            $f_id = $domain->parentNode->findvalue('@f_id');
-        }
-        elsif ( $domain->parentNode->parentNode->exists('@f_id') ) {
-            $f_id = $domain->parentNode->parentNode->findvalue('@f_id');
-        }
-        elsif ( $domain->parentNode->parentNode->parentNode->exists('@f_id') ) {
-            $f_id = $domain->parentNode->parentNode->parentNode->findvalue('@f_id');
-        }
-        else {
-            die "ERROR! No f_id for domain $uid\n";
-        }
+        my $f_id = get_f_id_from_domain_node($domain);
 
-        if ( $domain->findvalue('@manual_rep') ne 'true' ) {
+        if ( !is_manual_domain_rep($domain)) { 
             my $parent_domain_uid;
-            if ( $domain->exists('ecod_representative_domain/@uid') ) {
-                $parent_domain_uid = $domain->findvalue('ecod_representative_domain/@uid');
-            }
-            elsif ( $domain->exists('ecod_representative_domain/@ecod_domain_id') ) {
-                my $parent_domain_id = $domain->findvalue('ecod_representative_domain/@ecod_domain_id');
-                $parent_domain_uid = $old_domain_domainid2uid{$parent_domain_id};
-            }
-            elsif ( $domain->exists('derived_range/@derivedFrom') ) {
+			if (has_ecod_rep_domain_node($domain)) { 
+				my $ecod_rep_domain_node = get_ecod_rep_domain_node($domain);
+				$parent_domain_uid = get_uid($ecod_rep_domain_node);
+			}
+			elsif ( $domain->exists('derived_range/@derivedFrom') ) {
                 $parent_domain_uid = $domain->findvalue('derived_range/@derivedFrom');
             }
             elsif ( $domain->exists('scop_representative_domain/@scop_domain_id') ) {
@@ -4151,6 +4473,7 @@ sub merge_new_ecod_pre_xml_to_old_ecod_xml {
     }
 
     print "Generate old domain rules\n";
+	#$DEBUG = 1;
     foreach my $old_domain ( sort { $a cmp $b } keys %old_domain_seen ) {
         if ( $old_domain_da{$old_domain} ) { next }    #da moves only with da now
         if ( $new_domain_seen{$old_domain} && $old_domain_range{$old_domain} eq $new_domain_range{$old_domain} ) {
@@ -4163,7 +4486,7 @@ sub merge_new_ecod_pre_xml_to_old_ecod_xml {
                         #This is not correctly distinguishing domains that are changed from non-rep to rep
                         if ($DEBUG) {
                             print
-"DOMAIN_CORRESPONDENCE $old_domain $new_domain_uid{$old_domain} $old_domain_uid{$old_domain} $new_domain_range{$old_domain} $old_domain_range{$old_domain} $old_domain_type{$old_domain} $new_domain_type{$old_domain}\n";
+"DOMAIN_CORRESPONDENCE 1:$old_domain 2:$new_domain_uid{$old_domain} 3:$old_domain_uid{$old_domain} 4:$new_domain_range{$old_domain} 5:$old_domain_range{$old_domain} 6:$old_domain_type{$old_domain} 7:$new_domain_type{$old_domain}\n";
                         }
 
                         my $modify_domain_node = $merge_xml_doc->createElement('modify');
@@ -4181,7 +4504,7 @@ sub merge_new_ecod_pre_xml_to_old_ecod_xml {
                         #CAse is broken or unnecessary?
                         if ($DEBUG) {
                             print
-"DOMAIN_CONVERTED_TO_REP $old_domain $new_domain_uid{$old_domain} $old_domain_uid{$old_domain} $new_domain_range{$old_domain} $old_domain_range{$old_domain}\n";
+"DOMAIN_CONVERTED_TO_REP 1:$old_domain 2:$new_domain_uid{$old_domain} 3:$old_domain_uid{$old_domain} 4:$new_domain_range{$old_domain} 5:$old_domain_range{$old_domain}\n";
                         }
 
                         my $modify_domain_node = $merge_xml_doc->createElement('modify');
@@ -4203,7 +4526,7 @@ sub merge_new_ecod_pre_xml_to_old_ecod_xml {
                     if ( $old_domain_type{$old_domain} eq $new_domain_type{$old_domain} ) {
                         if ($DEBUG) {
                             print
-"DOMAIN_CONVERTER_TO_ASSEMBLY_MEMBER $old_domain $new_domain_uid{$old_domain} $old_domain_uid{$old_domain} $new_domain_range{$old_domain} $old_domain_range{$old_domain}\n";
+"DOMAIN_CONVERTER_TO_ASSEMBLY_MEMBER 1:$old_domain 2:$new_domain_uid{$old_domain} 3:$old_domain_uid{$old_domain} 4:$new_domain_range{$old_domain} 5:$old_domain_range{$old_domain}\n";
                         }
                         my $modify_domain_node = $merge_xml_doc->createElement('modify');
                         $modify_domain_node->setAttribute( 'type',     'domain' );
@@ -4266,8 +4589,10 @@ sub merge_new_ecod_pre_xml_to_old_ecod_xml {
 
         }
         elsif ( $old_domain_type{$old_domain} eq 'derived' ) {
-
-            #print "DERIVED_DOMAIN $old_domain $old_domain_uid{$old_domain}\n";
+			#What does this case do?
+			if ($DEBUG ) { 
+				print "DERIVED_DOMAIN od:$old_domain od_uid:$old_domain_uid{$old_domain} od_fid:$old_domain_fid{$old_domain} nd_fid:$new_domain_fid{$old_domain}\n";
+			}
 
             my $modify_domain_node = $merge_xml_doc->createElement('modify');
             $modify_domain_node->setAttribute( 'type',     'domain' );
@@ -4292,7 +4617,9 @@ sub merge_new_ecod_pre_xml_to_old_ecod_xml {
 
         }
         else {
-            #print "OBSOLETE_DOMAIN $old_domain $old_domain_uid{$old_domain} $old_domain_parent{$old_domain}\n";
+			if ($DEBUG) { 
+				print "OBSOLETE_DOMAIN $old_domain $old_domain_uid{$old_domain} $old_domain_parent{$old_domain}\n";
+			}
 
             my $obsolete_domain_node = $merge_xml_doc->createElement('obsolete');
             $obsolete_domain_node->setAttribute( 'type', 'domain' );
@@ -4316,7 +4643,7 @@ sub merge_new_ecod_pre_xml_to_old_ecod_xml {
 
         if ( $old_domain_seen{$new_domain} && $old_domain_range{$new_domain} eq $new_domain_range{$new_domain} ) {
 
-            #print "DOMAIN_CORRESPONDENCE $new_domain $new_domain_uid{$new_domain} $old_domain_uid{$new_domain}\n";
+            print "DOMAIN_CORRESPONDENCE $new_domain $new_domain_uid{$new_domain} $old_domain_uid{$new_domain}\n";
         }
         else {
             if ($DEBUG) {
@@ -4401,7 +4728,7 @@ sub remove_obsolete_ecod_nodes {
     my ( $old_index, $obs_merge_index ) = @_;
 
     foreach my $obs_d_uid ( @{ $$obs_merge_index{d} } ) {
-        $$old_index{d}{$obs_d_uid}->setAttribute( 'isObsolete', 'true' );
+        $$old_index{d}{$obs_d_uid}->setAttribute( 'is_obsolete', 'true' );
 
     }
 
@@ -4410,7 +4737,7 @@ sub remove_obsolete_ecod_nodes {
         my $warning = 0;
         foreach my $child_h_node ( find_h_group_nodes($x_node) ) {
             my $h_id = get_h_id($child_h_node);
-            if ( !isObsolete($child_h_node) ) {
+            if ( !is_obsolete($child_h_node) ) {
                 print "WARNING! Obsoletion of X-group $x_id orphans non-obsolete H-group $h_id\n";
                 $warning++;
             }
@@ -4425,7 +4752,7 @@ sub remove_obsolete_ecod_nodes {
         my $warning = 0;
         foreach my $child_f_node ( find_f_group_nodes($h_node) ) {
             my $f_id = get_f_id($child_f_node);
-            if ( !isObsolete($child_f_node) ) {
+            if ( !is_obsolete($child_f_node) ) {
                 print "WARNING! Obsoletion of H-group $h_id orphans non-obsolete F-group $f_id\n";
                 $warning++;
             }
@@ -4440,7 +4767,7 @@ sub remove_obsolete_ecod_nodes {
         my $warning = 0;
         foreach my $child_domain_node ( find_domain_nodes($f_node) ) {
             my $child_uid = get_uid($child_domain_node);
-            if ( !isObsolete($child_domain_node) ) {
+            if ( !is_obsolete($child_domain_node) ) {
                 if ( $child_domain_node->findvalue('derived_range') eq 'true' ) {
                     print "WARNING! Obsoletion of F-group $f_id orphans derived domain $child_uid\n";
                 }
@@ -4467,7 +4794,7 @@ sub add_new_mod_old_ecod_nodes {
         my $new_arch_name = $$new_arch{arch_name};
 
         #Name collision check for architectuere is necessary because of lack of id in manual table
-        if ( has_arch_name( $old_ecod_xml_doc, $new_arch_name ) ) {
+        if ( exists_child_arch_name( $old_ecod_xml_doc, $new_arch_name ) ) {
             die "ERROR! old->new arch_name conflict on $new_arch_name\n";
         }
 
@@ -4542,7 +4869,7 @@ sub add_new_mod_old_ecod_nodes {
         }
 
         my $obs_x_node = $$old_index{x}{ $$obs_x{x_id} };
-        $obs_x_node->setAttribute( 'isObsolete', 'true' );
+        $obs_x_node->setAttribute( 'is_obsolete', 'true' );
     }
 
     #New H-groups
@@ -4595,7 +4922,7 @@ sub add_new_mod_old_ecod_nodes {
             die "ERROR! COuld not find obs h_group for $obs_h_id\n";
         }
 
-        $obs_h_node->setAttribute( 'isObsolete', 'true' );    #Are these being annotated twice?
+        $obs_h_node->setAttribute( 'is_obsolete', 'true' );    #Are these being annotated twice?
     }
 
     #New F-groups
@@ -4944,7 +5271,7 @@ sub get_primary_domain_id {
 		if (has_scop_domain_node($n)) { 
 			return get_scop_domain_id(get_scop_domain_node($n))
 		}elsif(has_ecod_domain_node($n)){
-			return get_ecod_domain_node(get_ecod_domain_id($n));
+			return get_ecod_domain_id(get_ecod_domain_node($n));
 		}else{
 			return 'NA'
 		}
@@ -4962,12 +5289,13 @@ sub get_scop_domain_node {
 sub get_ecod_domain_node { 
 	$_[0]->findnodes('ecod_domain')->get_node(1);
 }
-sub has_ecod_domain_node { 
-	$_[0]->exists('ecod_domain');
-}
+
 
 sub get_primary_domain_node { 
 	$_[0]->findnodes('domain[@primary="true"]')->get_node(1);
+}
+sub get_ecod_rep_domain_node { 
+	$_[0]->findnodes('ecod_representative_domain')->get_node(1);
 }
 
 sub has_comment {
@@ -5059,7 +5387,7 @@ sub create_new_arch {
     return $new_arch_node;
 }
 
-sub has_arch_name {
+sub exists_child_arch_name {
     $_[0]->exists(qq{.//architecture[\@arch_name="$_[1]"]});
 }
 
@@ -5140,10 +5468,6 @@ sub new_merge_index {
         }
     }
     return \%index;
-}
-
-sub get_arch_ordinal {
-    $_[0]->findvalue('@arch_ordinal');
 }
 
 sub get_arch_attrs {
@@ -6253,7 +6577,7 @@ sub apply_merge {
             print "DEBUG obs x: $obs_x_id\n";
         }
 
-        $obs_x_group_node->setAttribute( 'isObsolete', 'true' );
+        $obs_x_group_node->setAttribute( 'is_obsolete', 'true' );
     }
 
     #H-groups
@@ -6340,7 +6664,7 @@ sub apply_merge {
         #my $obs_h_group_node	= $old_ecod_xml_doc->findnodes(qq{//h_group[\@h_id="$obs_h_id"]})->get_node(1);
         my $obs_h_group_node = $old_h_nodes{$obs_h_id};
 
-        $obs_h_group_node->setAttribute( 'isObsolete', 'true' );
+        $obs_h_group_node->setAttribute( 'is_obsolete', 'true' );
 
         if ($DEBUG) {
             print "DEBUG obs_h: $obs_h_id\n";
@@ -6478,12 +6802,12 @@ sub apply_merge {
         my $sql_uid = sprintf "%09i", sql_uid_gen();
 
         if ($DEBUG) {
-            print "DEBUG new_d: $new_domain_uid->$sql_uid";
+            print "DEBUG new_d: $new_domain_uid->$sql_uid\n";
         }
 
         my $new_ecod_domain_node;
 
-        if ( !$new_domain_nodes{$new_domain_uid} ) {
+        if ( !exists $new_domain_nodes{$new_domain_uid} ) {
             print "WARNING! Could not find new domain node for $new_domain_uid, skipping...\n";
             next;
         }
@@ -6509,7 +6833,7 @@ sub apply_merge {
             }
 
             my $old_domain_assembly_node;
-            if ( $domain_assembly_uid{$new_domain_uid} ) {
+            if ( exists $domain_assembly_uid{$new_domain_uid} ) {
                 my $da_uid = $domain_assembly_uid{$new_domain_uid};
                 $old_domain_assembly_node =
                   $old_ecod_xml_doc->findnodes(qq{//domain_assembly[\@uid="$da_uid"]})->get_node(1);
@@ -6573,7 +6897,7 @@ sub apply_merge {
     my %current_da_uids;
     foreach my $mod_domain_uid ( sort { $a cmp $b } keys %mod_d ) {
 
-        if ( $mod_d{$mod_domain_uid}{derived_shift} ) {
+        if (  $mod_d{$mod_domain_uid}{derived_shift} ) {
 
             my $parent_uid  = $mod_d{$mod_domain_uid}{parent_uid};
             my $parent_f_id = $mod_d{$mod_domain_uid}{parent_f_id};    #This is just F-id, not parent F-id
@@ -6618,7 +6942,6 @@ sub apply_merge {
             my $new_parent_f_id  = $parent_f_node->findvalue('@f_id');
             my $new_current_f_id = $current_f_node->findvalue('@f_id');
 
-          #print "DEBUG $domain_id\t$new_parent_f_id\t$parent_f_id\t$new_current_f_id\t$mod_domain_uid\t$parent_uid\n";
           #Shouldn't this happen much earlier, why even make an derived_shift mod in the first place if it is not needed
             if (   $parent_f_node->findvalue('@f_id') ne $parent_f_id
                 || $current_f_node->findvalue('@f_id') ne $parent_f_id )
@@ -6629,6 +6952,7 @@ sub apply_merge {
 
             if ($DEBUG) {
                 print "DEBUG mod_d derived_shift: $mod_domain_uid $domain_id child of $parent_uid $parent_f_id\n";
+			    print "DEBUG $domain_id\t$new_parent_f_id\t$parent_f_id\t$new_current_f_id\t$mod_domain_uid\t$parent_uid\n";
             }
 
         }
@@ -6758,7 +7082,11 @@ sub apply_merge {
 
             my $new_f_id   = $mod_d{$mod_domain_uid}{new_fid};
             my $old_f_node = $old_ecod_xml_doc->findnodes(qq{//f_group[\@f_id="$new_f_id"]})->get_node(1);
-            $old_f_node->appendChild($old_domain_node);
+			if ($old_f_node) { 
+				$old_f_node->appendChild($old_domain_node);
+			}else{
+				die "ERROR! new f_id $new_f_id not found for $mod_domain_uid\n";
+			}
 
             my $old_domain_type = $mod_d{$mod_domain_uid}{old_domain_type};
             my $new_domain_type = $mod_d{$mod_domain_uid}{new_domain_type};
@@ -6969,7 +7297,7 @@ sub apply_merge {
 
         my $old_domain_node = $old_ecod_xml_doc->findnodes(qq{//domain[\@uid="$obs_domain_uid"]})->get_node(1);
 
-        $old_domain_node->setAttribute( 'isObsolete', 'true' );
+        $old_domain_node->setAttribute( 'is_obsolete', 'true' );
 
     }
 
@@ -6982,7 +7310,7 @@ sub apply_merge {
             my $warning = 0;
             foreach my $child_h_node ( $x_node->findnodes('h_group')->get_nodelist() ) {
                 my $child_h_id = $child_h_node->findvalue('@h_id');
-                if ( $child_h_node->findvalue('@isObsolete') ne 'true' ) {
+                if ( $child_h_node->findvalue('@is_obsolete') ne 'true' ) {
                     print "WARNING! Obsoletion of X-group $obs_x_id orphans non-obsolete H-group $child_h_id\n";
                     $warning++;
                 }
@@ -7000,7 +7328,7 @@ sub apply_merge {
             my $warning = 0;
             foreach my $child_f_node ( $h_node->findnodes('f_group')->get_nodelist() ) {
                 my $child_f_id = $child_f_node->findvalue('@f_id');
-                if ( $child_f_node->findvalue('@isObsolete') ne 'true' ) {
+                if ( $child_f_node->findvalue('@is_obsolete') ne 'true' ) {
                     print "WARNING! Obsoletion of H-group $obs_h_id orphans non-obsolete F-group $child_f_id\n";
                     $warning++;
                 }
@@ -7018,7 +7346,7 @@ sub apply_merge {
             my $warning = 0;
             foreach my $child_domain_node ( $f_node->findnodes('domain')->get_nodelist() ) {
                 my $child_domain_id = $child_domain_node->findvalue('@uid');
-                if ( $child_domain_node->findvalue('@isObsolete') ne 'true' ) {
+                if ( $child_domain_node->findvalue('@is_obsolete') ne 'true' ) {
                     if ( $child_domain_node->findvalue('derived_range') eq 'true' ) {
                         print "WARNING! Obsoletion of F-group $obs_f_id orphans derived domain $child_domain_id\n";
                     }
@@ -7892,7 +8220,7 @@ sub rep_check_ecodf {
                             }
                             else {
                                 die
-"ERROR! Could not deference manual range and scop domain id to an ecod uid for $domain_id\n";
+"ERROR! Could not dereference manual range and scop domain id to an ecod uid for $domain_id\n";
                             }
 
                         }
@@ -8131,7 +8459,6 @@ sub build_chainwise {
     my %domain_ranges;
     my %domain_pdb_ranges;
 
-    my $domain_nodes = find_domain_nodes($ecod_xml_doc);
 
     my %ecod_domain_ids;
     my %scop_domain_ids;
@@ -8148,7 +8475,7 @@ sub build_chainwise {
     my %prov_man;
     my %obsolete;
     my %ecodf_annot;
-    foreach my $d_node ( $domain_nodes->get_nodelist() ) {
+    foreach my $d_node ( find_domain_nodes($ecod_xml_doc)) { 
 
         my ( $uid, $ecod_domain_id ) = get_ids($d_node);
 
@@ -8206,7 +8533,7 @@ sub build_chainwise {
             $prov_man{$uid}++;
         }
 
-        if ( $d_node->findvalue('@isObsolete') eq 'true' ) {
+        if ( $d_node->findvalue('@is_obsolete') eq 'true' ) {
             $obsolete{$uid}++;
         }
 
@@ -8244,7 +8571,6 @@ sub build_chainwise {
 
     foreach my $pdb_id ( keys %pdb_chain ) {
         my $pdb_node = $ecod_chain_xml_doc->createElement('pdb');
-
         $pdb_node->setAttribute( 'pdb_id', $pdb_id );
         $pdb_chain_list_node->appendChild($pdb_node);
 
@@ -8319,6 +8645,7 @@ sub build_chainwise {
 
                     #print "e: $ecod_domain_id s: $seqid_range p: $pdb_range\n";
 
+					my %seg_aref;
                     for ( my $i = 0 ; $i < scalar(@segs) ; $i++ ) {
                         my $seg = $segs[$i];
                         $seg =~ /((.):.*)/ or die "ERROR! $seg\n";
@@ -8327,101 +8654,70 @@ sub build_chainwise {
                         my $pdb_seg         = $pdb_segs[$i];
                         $pdb_seg =~ /((.):.*)/ or die "ERROR! $pdb_seg\n";
                         my $seg_pdb_range = $1;
-                        if ( $pdb_node->exists(qq{chain[\@chain_id='$seg_chain']}) ) {
-                            my $pseudo_chain_node =
+
+						push (@{$seg_aref{$seg_chain}{seg}}, $seg_seqid_range);
+						push (@{$seg_aref{$seg_chain}{pdb}}, $seg_pdb_range);
+					}
+
+					foreach my $seg_chain (keys %seg_aref) { 
+						
+						my $pseudo_chain_node;
+						if ( $pdb_node->exists(qq{chain[\@chain_id='$seg_chain']}) ) {
+                            $pseudo_chain_node =
                               $pdb_node->findnodes(qq{chain[\@chain_id='$seg_chain']})->get_node(1);
-                            if ( $pseudo_chain_node->exists(qq{domain[\@ecod_domain_id='$ecod_domain_id']}) ) {
-                                $pseudo_chain_node->removeChild(
-                                    $pseudo_chain_node->findnodes(qq{domain[\@ecod_domain_id='$ecod_domain_id']})
-                                      ->get_node(1) );
-                            }
-                            my $seg_domain_node = $ecod_chain_xml_doc->createElement('domain');
-
-                            $seg_domain_node->setAttribute( 'domain_fragment', 'true' );
-                            $seg_domain_node->setAttribute( 'range_type',      $range_type{$uid} );
-                            $seg_domain_node->setAttribute( 'ecod_domain_id',  $ecod_domain_id );
-                            $seg_domain_node->setAttribute( 'uid',             "$uid.$seg_count" );
-                            $seg_count++;
-
-                            my $seg_range_node = $ecod_chain_xml_doc->createElement('seqid_range');
-                            $seg_range_node->appendTextNode($seg_seqid_range);
-                            my $seg_pdb_range_node = $ecod_chain_xml_doc->createElement('pdb_range');
-                            $seg_pdb_range_node->appendTextNode($seg_pdb_range);
-
-                            $seg_domain_node->appendChild($seg_range_node);
-                            $seg_domain_node->appendChild($seg_pdb_range_node);
-
-                            if ( $recut{$dom_uid} ) {
-                                $seg_domain_node->setAttribute( 'recut', 'true' );
-                            }
-                            if ( $side_load{$dom_uid} ) {
-                                $seg_domain_node->setAttribute( 'side_load', 'true' );
-                            }
-                            if ( $isAssembly{$dom_uid} ) {
-                                $seg_domain_node->setAttribute( 'domain_assembly', 'true' );
-                            }
-                            if ( $prov_man{$dom_uid} ) {
-                                $seg_domain_node->setAttribute( 'provisional', 'true' );
-                            }
-                            if ( $obsolete{$dom_uid} ) {
-                                $seg_domain_node->setAttribute( 'obsolete', 'true' );
-                            }
-
-                            if ($USE_ECODF) {
-                                if ( $ecodf_annot{$dom_uid} ) {
-                                    foreach my $ecodf_acc ( @{ $ecodf_annot{$dom_uid} } ) {
-                                        my $ecodf_annot_node = $ecod_chain_xml_doc->createElement('ecodf_annot');
-                                        $ecodf_annot_node->setAttribute( 'ecodf_acc', $ecodf_acc );
-                                        $domain_node->appendChild($ecodf_annot_node);
-                                    }
-                                }
-                            }
-                            $pseudo_chain_node->appendChild($seg_domain_node);
+												
                         }
                         else {
-                            my $pseudo_chain_node = $ecod_chain_xml_doc->createElement('chain');
+                            $pseudo_chain_node = $ecod_chain_xml_doc->createElement('chain');
                             $pseudo_chain_node->setAttribute( 'chain_id', $seg_chain );
                             $pdb_node->appendChild($pseudo_chain_node);
 
-                            #my ($seqid_aref, $struct_seqid_aref, $pdbnum_aref) = pdbml_seq_parse($pdb_id, $seg_chain);
-                            #$pseudo_chain_node->setAttribute('chain_case_ambiguous', 'true');
-                            #my $seqid_range = rangify(@$seqid_aref);
-                            #$pseudo_chain_node->appendTextChild('seqid_range', $seqid_range);
+							$pdb_node->appendChild($pseudo_chain_node);
+						}
+                               
+						my $seg_domain_node = $ecod_chain_xml_doc->createElement('domain');
 
-                            my $seg_domain_node = $ecod_chain_xml_doc->createElement('domain');
-                            $seg_domain_node->setAttribute( 'domain_fragment', 'true' );
-                            $seg_domain_node->setAttribute( 'ecod_domain_id',  $ecod_domain_id );
-                            $seg_domain_node->setAttribute( 'uid',             "$uid.$seg_count" );
-                            $seg_count++;
+						$seg_domain_node->setAttribute( 'domain_fragment', 'true' );
+						$seg_domain_node->setAttribute( 'range_type',      $range_type{$uid} );
+						$seg_domain_node->setAttribute( 'ecod_domain_id',  $ecod_domain_id );
+						$seg_domain_node->setAttribute( 'uid',             "$uid.$seg_count" );
+						$seg_count++;
 
-                            $uid =~ /(\d{9}).\d+/;
-                            $seg_domain_node->setAttribute( 'range_type', $range_type{$uid} );
+						my $seg_range_node = $ecod_chain_xml_doc->createElement('seqid_range');
+						$seg_range_node->appendTextNode(join ("," ,@{$seg_aref{$seg_chain}{seg}}));
+						my $seg_pdb_range_node = $ecod_chain_xml_doc->createElement('pdb_range');
+						$seg_pdb_range_node->appendTextNode(join (",", @{$seg_aref{$seg_chain}{pdb}}));
 
-                            $pseudo_chain_node->appendChild($seg_domain_node);
-                            my $seg_range_node = $ecod_chain_xml_doc->createElement('seqid_range');
-                            $seg_range_node->appendTextNode($seg_seqid_range);
-                            my $seg_pdb_range_node = $ecod_chain_xml_doc->createElement('pdb_range');
-                            $seg_pdb_range_node->appendTextNode($seg_pdb_range);
-                            $seg_domain_node->appendChild($seg_range_node);
-                            $seg_domain_node->appendChild($seg_pdb_range_node);
+						$seg_domain_node->appendChild($seg_range_node);
+						$seg_domain_node->appendChild($seg_pdb_range_node);
 
-                            if ( $recut{$dom_uid} ) {
-                                $seg_domain_node->setAttribute( 'recut', 'true' );
-                            }
-                            if ( $side_load{$dom_uid} ) {
-                                $seg_domain_node->setAttribute( 'side_load', 'true' );
-                            }
-                            if ( $isAssembly{$dom_uid} ) {
-                                $seg_domain_node->setAttribute( 'domain_assembly', 'true' );
-                            }
-                            if ( $prov_man{$dom_uid} ) {
-                                $seg_domain_node->setAttribute( 'provisional', 'true' );
-                            }
-                            if ( $obsolete{$dom_uid} ) {
-                                $seg_domain_node->setAttribute( 'obsolete', 'true' );
-                            }
-                            $pdb_node->appendChild($pseudo_chain_node);
-                        }
+						if ( $recut{$dom_uid} ) {
+							$seg_domain_node->setAttribute( 'recut', 'true' );
+						}
+						if ( $side_load{$dom_uid} ) {
+							$seg_domain_node->setAttribute( 'side_load', 'true' );
+						}
+						if ( $isAssembly{$dom_uid} ) {
+							$seg_domain_node->setAttribute( 'domain_assembly', 'true' );
+						}
+						if ( $prov_man{$dom_uid} ) {
+							$seg_domain_node->setAttribute( 'provisional', 'true' );
+						}
+						if ( $obsolete{$dom_uid} ) {
+							$seg_domain_node->setAttribute( 'obsolete', 'true' );
+						}
+
+						if ($USE_ECODF) {
+							if ( $ecodf_annot{$dom_uid} ) {
+								foreach my $ecodf_acc ( @{ $ecodf_annot{$dom_uid} } ) {
+									my $ecodf_annot_node = $ecod_chain_xml_doc->createElement('ecodf_annot');
+									$ecodf_annot_node->setAttribute( 'ecodf_acc', $ecodf_acc );
+									$domain_node->appendChild($ecodf_annot_node);
+								}
+							}
+						}
+						$pseudo_chain_node->appendChild($seg_domain_node);
+
                     }
 
                     #nothing for now
@@ -8873,7 +9169,7 @@ sub generate_domain_fasta_jobs {
         print OUT "#\$ -S /bin/bash\n";
         print OUT "#\$ -M dustin.schaeffer\@gmail.com\n";
 
-        #print OUT "generate_seqdb_from_ecod_para.pl ecod.twig.xml $i\n";
+		print "$dir/$seq_input_fn $i\n";
         print OUT "$GENERATE_SEQDB_EXE $dir/$seq_input_fn $i\n";
 
         push( @jobs, "$dir/para.$i.job" );
@@ -9252,24 +9548,48 @@ sub convert_hmmer_txt_to_xml {
 
     my ( $txt_input_fn, $xml_output_fn, $ecodf_fn ) = @_;
 
-    my $ecodf_xml_doc;
-    if ( !$ecodf_fn ) {
-        $ecodf_fn = $ECODF_XML_FN;
-    }
-    $ecodf_xml_doc = xml_open($ecodf_fn);
+	my %ecodf_acc2ecodf_name;
+	my %ecodf_acc2pfam_acc;
 
-    my %ecodf_acc2ecodf_name;
-    my %ecodf_acc2pfam_acc;
+	my $ECODF_SQL = 1;
+	if ($ECODF_SQL) { 
 
-    foreach my $family_node ( $ecodf_xml_doc->findnodes('//family') ) {
-        my $ecodf_acc  = get_short_ecodf_acc($family_node);
-        my $pfam_acc   = $family_node->findvalue('@pfam_acc');
-        my $ecodf_name = $family_node->findvalue('@ecodf_id');
+		my $dbh = db_connect('ecod_curation');
+		my $sth = $dbh->prepare('SELECT ecodf_acc, pfam_acc, ecodf_id FROM ecodf_family_list');
+		$sth->execute();
+		while (my $row_aref = $sth->fetchrow_arrayref() ) { 
+			my $ecodf_acc 	= $$row_aref[0];
+			$ecodf_acc =~ /(EF\d+)\./;
+			$ecodf_acc = $1;
+			my $pfam_acc 	= $$row_aref[1];
+			if ($pfam_acc) { 
+				$pfam_acc =~ /(PF\d+)\./;
+				$pfam_acc = $1;
+				$ecodf_acc2pfam_acc{$ecodf_acc}   = $pfam_acc;
+			}
 
-        $ecodf_acc2ecodf_name{$ecodf_acc} = $ecodf_name;
-        $ecodf_acc2pfam_acc{$ecodf_acc}   = $pfam_acc;
+			my $ecodf_name 	= $$row_aref[2];
+			$ecodf_acc2ecodf_name{$ecodf_acc} = $ecodf_name;
 
-    }
+		}
+
+	}else{
+		my $ecodf_xml_doc;
+		if ( !$ecodf_fn ) {
+			$ecodf_fn = $ECODF_XML_FN;
+		}
+		$ecodf_xml_doc = xml_open($ecodf_fn);
+
+		foreach my $family_node ( $ecodf_xml_doc->findnodes('//family') ) {
+			my $ecodf_acc  = get_short_ecodf_acc($family_node);
+			my $pfam_acc   = $family_node->findvalue('@pfam_acc');
+			my $ecodf_name = $family_node->findvalue('@ecodf_id');
+
+			$ecodf_acc2ecodf_name{$ecodf_acc} = $ecodf_name;
+			$ecodf_acc2pfam_acc{$ecodf_acc}   = $pfam_acc;
+
+		}
+	}
 
     open( IN, $txt_input_fn ) or die "ERROR! Could not open $txt_input_fn for reading:$!\n";
 
@@ -10317,6 +10637,7 @@ sub generate_blast_library {
 }
 
 sub clans_read {
+
     my $sub = 'clans_read';
     my ($file) = @_;
 
@@ -10335,5 +10656,63 @@ sub clans_read {
         $name_lookup{$acc}    = $pf_name;
     }
     return ( \%acc_lookup, \%name_lookup );
+}
+
+sub get_asym_id { 
+	$_[0]->findvalue('@asym_id');
+}
+sub generate_residues_ref_xml { 
+	my ($pdb_id, $chain_id, $pdbml, $fn) = @_;
+
+	my $ppss_xpath = "//PDBx:pdbx_poly_seq_schemeCategory/PDBx:pdbx_poly_seq_scheme/PDBx:pdb_strand_id[text()=\'$chain_id\']";
+
+	my %seq_ids;
+
+	my @pdb_seq_nums;
+	my @struct_seq_ids;
+	my @seq_ids;
+
+	foreach my $ppss_node ($pdbml->findnodes($ppss_xpath)) { 
+		my $parent_node = $ppss_node->parentNode;
+
+		my ($seq_id, $auth_seq_num, $pdb_seq_num) = get_ppss_seq_ids($parent_node);
+		my $asym_id = get_asym_id($parent_node);
+		if (defined $auth_seq_num) { 
+			if ($parent_node->findvalue('PDBx:pdb_ins_code/@xsi:nil') ne 'true') { 
+				my $pdb_ins_code = $parent_node->findvalue('PDBx:pdb_ins_code');
+				$pdb_seq_nums[$seq_id] = $pdb_seq_num . $pdb_ins_code;
+			}else{
+				$pdb_seq_nums[$seq_id] = $pdb_seq_num;
+			}
+		}
+		if ($seq_ids{$seq_id}) { 
+			print "WARNING!  duplicate seq id $seq_id in asym_id $asym_id, hetero?\n";
+			next;
+		}else{
+			$seq_ids{$seq_id}++;
+		}
+
+		if ($auth_seq_num =~ /\d+/) { 
+			push (@struct_seq_ids, $seq_id);
+		}
+		push (@seq_ids, $seq_id);
+	}
+
+	my $struct_seqid_range = rangify(@struct_seq_ids);
+	my $seqid_range = rangify(@seq_ids);
+	
+	my $query_range = ungap_range($struct_seqid_range, $GAP_TOL);
+	my $query_range_aref = range_expand($query_range);
+
+	print "$pdb_id $chain_id $struct_seqid_range $seqid_range $query_range\n";
+	my ($residue_xml_doc, $residue_root_node) = xml_create("ecod_residue_document");
+
+	my $residue_range_node = $residue_xml_doc->createElement('residue_ranges');
+	$residue_root_node->appendChild($residue_range_node);
+	$residue_range_node->appendTextChild('struct_seqid_range', $struct_seqid_range);
+	$residue_range_node->appendTextChild('seqid_range', $seqid_range);
+	$residue_range_node->appendTextChild('query_range', $query_range);
+
+	xml_write($residue_xml_doc, $fn);	
 }
 1;
