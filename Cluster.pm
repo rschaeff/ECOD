@@ -24,6 +24,7 @@ our @EXPORT = (
 
 use ECOD::Update;
 use XML::Grishin;
+use SQL::Util;
 
 use Carp;
 use XML::LibXML;
@@ -437,29 +438,32 @@ sub generate_pf_group_cdhit_jobs {
         my $path = "$pf_fasta_dir/$pf_id";
         if ( !-d $path ) {
             if ( make_path($path) == 0 ) {
-                croak "ERROR! make_path failed on $path:$!\n";
+                #croak "ERROR! make_path failed on $path:$!\n";
             }
         }
 
         #my $pf_fasta_fn = "$path/$pf_id.$tag.fa"; #Why tagged?
         my $pf_fasta_fn = "$path/$pf_id.fa";
-        if ( -f $pf_fasta_fn ) {
+        if ( -f $pf_fasta_fn && -s $pf_fasta_fn > 0) {
             if ( $$global_opt{verify} ) {
                 unless ( verify( $pf_node, $pf_fasta_fn ) ) {
                     remove($pf_fasta_fn);
-                    gen_pf_fasta( $pf_node, $pf_fasta_fn );
+                    #gen_pf_fasta( $pf_node, $pf_fasta_fn );
+					gen_pf_fasta_sql( $pf_node, $pf_fasta_fn );
                 }
             }
             elsif ( $$global_opt{force_overwrite} ) {
                 remove($pf_fasta_fn);
-                gen_pf_fasta( $pf_node, $pf_fasta_fn );
+                #gen_pf_fasta( $pf_node, $pf_fasta_fn );
+				gen_pf_fasta_sql( $pf_node, $pf_fasta_fn );
             }
             else {
                 #warn "WARNING! $pf_fasta_fn exists, skipping...\n";
             }
         }
         else {
-            gen_pf_fasta( $pf_node, $pf_fasta_fn );
+            #gen_pf_fasta( $pf_node, $pf_fasta_fn );
+			gen_pf_fasta_sql( $pf_node, $pf_fasta_fn );
         }
         ( my $pf_clust_fn = $pf_fasta_fn ) =~ s/fa$/$tag.cdhit.clust/;
         if ( !-f $pf_clust_fn || $$global_opt{force_overwrite} ) {
@@ -504,7 +508,7 @@ sub generate_pf_group_blastclust_jobs {
         my $path = "$pf_fasta_dir/$pf_id";
         if ( !-d $path ) {
             if ( make_path($path) == 0 ) {
-                croak "ERROR! make_path failed on $path:$!\n";
+                #croak "ERROR! make_path failed on $path:$!\n";
             }
         }
 
@@ -1308,6 +1312,10 @@ sub gen_pf_fasta {
         my ( $uid, $ecod_domain_id ) = get_ids($domain_node);
 
         my $domain_fasta_fn = get_domain_fasta_fn($uid);
+		if (!$domain_fasta_fn) { 
+			warn "WARNING! empty fasta for $uid/$ecod_domain_id, skipping...\n";
+			next;
+		}
 
         open my $fh, "<", $domain_fasta_fn
           or die "ERROR! Could not open $domain_fasta_fn for reading:$!\n";
@@ -1322,6 +1330,26 @@ sub gen_pf_fasta {
         }
         close $fh;
     }
+	close $out_fh;
+}
+
+sub gen_pf_fasta_sql { 
+	my ( $pf_node, $pf_fasta_fn) = @_;
+	my $dbh = db_connect('ecod_curation');
+	my $sth = $dbh->prepare('SELECT fasta FROM domain_fasta WHERE uid = ?');
+    open my $out_fh, ">", $pf_fasta_fn
+          or die "ERROR! Could not open $pf_fasta_fn for appending:$!\n";
+	foreach my $domain_node (find_domain_nodes($pf_node)) { 
+		my ($uid, $ecod_domain_id) = get_ids($domain_node);
+		
+		$sth->execute($uid);
+		my $fasta;
+		while (my $row_aref = $sth->fetchrow_arrayref()) { 
+			$fasta = $$row_aref[0];
+			last;
+		}
+		print $out_fh ">$uid\n$fasta\n";
+	}
 	close $out_fh;
 }
 
